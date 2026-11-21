@@ -5,8 +5,6 @@
 #include <cmath>
 #include <cstdint>
 
-#include "camera_blur.hpp"
-#include "adaptive_vrs.hpp"
 #include "engine_settings.hpp"
 
 namespace dd2 {
@@ -18,7 +16,7 @@ struct Extent {
 };
 
 enum ActivationMode { adaptive, always_on, motion_only };
-enum class Activity { idle, combat, motion, forced, gpu_load };
+enum class Activity { idle, combat, motion, forced };
 
 struct CenterSize {
     float width{100.0f};
@@ -48,21 +46,38 @@ struct Settings {
     float combat_exit_delay{2.0f};
     int activation_mode{adaptive};
     int profile_mode{};
+    bool optimizer_enabled{true};
     bool enabled{true};
     bool verbose_logging{};
     bool shade_transparent_passes{true};
-    BorderBlurSettings border_blur{};
-    GpuGateSettings gpu_gate{};
+    bool allow_native_vrs{true};
     EngineSettings engine{};
     CenterSize center{};
     Extent reference{1280, 800};
 };
 
+inline constexpr Settings recommended_steam_deck_settings() {
+    Settings s;
+    s.motion_threshold = 1.8f;
+    s.hold = 1.2f;
+    s.combat_exit_delay = 2.5f;
+    s.activation_mode = always_on;
+    s.center = {85.0f, 85.0f, true, false};
+    s.engine.enabled = s.engine.always = s.engine.heavy = true;
+    s.engine.tweaks.fill(true);
+    s.engine.motion_target = 1.0f;
+    s.engine.shadow_pixels = 384.0f;
+    auto& crowd = s.engine.crowd;
+    crowd.enabled = crowd.npc = crowd.pawn = true;
+    crowd.npc_baseline = 20;
+    crowd.manual_npc_limit = 0;
+    crowd.pawn_min = 2;
+    crowd.pawn_baseline = 2;
+    return s;
+}
+
 inline void sanitize(Settings& s) {
-    sanitize(s.border_blur);
     sanitize(s.engine);
-    s.gpu_gate.target_ms = std::clamp(s.gpu_gate.target_ms, 16.6f, 33.3f);
-    s.gpu_gate.band_ms = std::clamp(s.gpu_gate.band_ms, 1.0f, 5.0f);
     s.motion_threshold = std::clamp(s.motion_threshold, 0.1f, 20.0f);
     s.hold = std::clamp(s.hold, 0.0f, 3.0f);
     s.combat_exit_delay = std::clamp(s.combat_exit_delay, 0.0f, 30.0f);
@@ -123,7 +138,7 @@ struct Combat {
 };
 
 inline Activity activity(const Settings& s, bool moving, bool in_combat) {
-    if (!s.enabled || full_sharp_center(s.center)) return Activity::idle;
+    if (!s.optimizer_enabled || !s.enabled || full_sharp_center(s.center)) return Activity::idle;
     if (s.activation_mode == always_on) return Activity::forced;
     if (s.activation_mode == adaptive && in_combat) return Activity::combat;
     return moving ? Activity::motion : Activity::idle;
@@ -168,16 +183,18 @@ inline CenterSize resolve_center(Extent extent, uint32_t tile, const Profile& pr
 }
 
 struct ShadingEllipse {
-    float x_radius, y_radius, transition_ratio;
+    float x_radius{}, y_radius{}, transition_ratio{};
     bool full_screen{};
+    float transition_ratio_sq{transition_ratio * transition_ratio};
     bool operator==(const ShadingEllipse&) const = default;
 };
 
 inline ShadingEllipse shading_ellipse(Extent extent, uint32_t tile, const Profile& profile, CenterSize size = {}) {
     size = resolve_center(extent, tile, profile, size);
     const float radius_per_percent = fullscreen_radius(extent) / 100.0f;
+    const float ratio = profile.mid / profile.inner;
     return {radius_per_percent * size.width, radius_per_percent * size.height,
-            profile.mid / profile.inner, full_sharp_center(size)};
+            ratio, full_sharp_center(size), ratio * ratio};
 }
 
 inline uint8_t rate_at(Extent extent, uint32_t tile, uint32_t x, uint32_t y,
@@ -188,34 +205,8 @@ inline uint8_t rate_at(Extent extent, uint32_t tile, uint32_t x, uint32_t y,
     const float dy = (std::min((y + 0.5f) * tile, extent.height - 0.5f) - extent.height * center_y) / ellipse.y_radius;
     const float distance_squared = dx * dx + dy * dy;
     if (distance_squared <= 1.0f) return rate_1x1;
-    if (!additional_rates || distance_squared > ellipse.transition_ratio * ellipse.transition_ratio) return rate_2x2;
+    if (!additional_rates || distance_squared > ellipse.transition_ratio_sq) return rate_2x2;
     return ((x + y) & 1) ? rate_2x1 : rate_1x2;
-}
-
-inline uint8_t adaptive_rate_at(Extent extent, uint32_t tile, uint32_t x, uint32_t y,
-                                ShadingEllipse ellipse, bool additional, unsigned variant) {
-    if (!variant || ellipse.full_screen) return rate_at(extent, tile, x, y, ellipse, additional);
-    const auto direction = static_cast<MaskDirection>((variant - 1) / mask_levels);
-    const float level = float(1 + (variant - 1) % mask_levels) / mask_levels;
-    float strength = 0.25f + level * 0.45f;
-    if (direction != MaskDirection::uniform) {
-        const float px = 2.0f * (float(x) + 0.5f) * tile / extent.width - 1.0f;
-        const float py = 2.0f * (float(y) + 0.5f) * tile / extent.height - 1.0f;
-        float trailing{};
-        switch (direction) {
-        case MaskDirection::left: trailing = -px; break;
-        case MaskDirection::right: trailing = px; break;
-        case MaskDirection::top: trailing = -py; break;
-        case MaskDirection::bottom: trailing = py; break;
-        default: break;
-        }
-        if (trailing <= 0.0f) return rate_1x1;
-        strength = std::clamp(trailing * 1.5f, 0.0f, 1.0f) * (0.55f + 0.45f * level);
-    }
-    const float full = fullscreen_radius(extent);
-    ellipse.x_radius = std::lerp(full, ellipse.x_radius, strength);
-    ellipse.y_radius = std::lerp(full, ellipse.y_radius, strength);
-    return rate_at(extent, tile, x, y, ellipse, additional);
 }
 
 } // namespace dd2

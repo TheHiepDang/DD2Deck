@@ -3,11 +3,9 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <type_traits>
-#include <optional>
 
 #include "platform.h"
 #include "vrs_core.hpp"
-#include "blur_probe.hpp"
 
 namespace dd2 {
 
@@ -33,7 +31,7 @@ enum class Diagnostic : size_t {
     nonindexed_calls, nonindexed_image_bound, indirect_calls, indirect_image_bound,
     rate_combiner_preserved, engine_image_deferred, render_pass_begins, bundle_calls,
     dispatch_calls, unbind_om, unbind_pso, unbind_dispatch, unbind_indirect, indirect_signature_skipped,
-    om_output_excluded, om_transparent_image_bound, count
+    om_output_excluded, om_transparent_image_bound, om_viewport_fallback, count
 };
 
 struct BindingSample {
@@ -67,22 +65,18 @@ struct Status {
     uint64_t indirect_with_image{};
     bool failed{};
     bool mask_pending{};
+    bool hot_hooks_active{}, hot_hooks_out_of_sync{};
 };
 
 struct AuditReport;
 bool start(ID3D12Device* device, ID3D12CommandQueue* queue, const Settings& settings);
-void frame(ID3D12Device* device, ID3D12CommandQueue* queue, const Settings& settings, int preset, Extent output,
-           unsigned variant = 0);
-void set_preset(int preset, unsigned variant = 0);
-std::optional<float> begin_gpu_frame(ID3D12Device*, ID3D12CommandQueue*, bool enabled);
-void end_gpu_frame();
-void reset_gpu_frame();
+void frame(ID3D12Device* device, ID3D12CommandQueue* queue, const Settings& settings, int preset, Extent output);
+void set_preset(int preset);
+void set_optimizer_enabled(bool enabled);
 void set_transparent_passes(bool enabled);
+void set_swapchain_backbuffers(ID3D12Resource* const* buffers, size_t count);
 Status status();
 Diagnostics take_diagnostics();
 AuditReport take_audit();
-void begin_blur_probe();
-BlurProbeReport finish_blur_probe();
-
 } // namespace graphics
 } // namespace dd2

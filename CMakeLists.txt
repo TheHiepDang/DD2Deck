@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(dd2_foveated_vrs VERSION 0.3.1 LANGUAGES C CXX)
+project(dd2_foveated_vrs VERSION 0.4.8 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT (MSVC OR MINGW))
     message(FATAL_ERROR "Use x64 MSVC or an x86_64-w64-mingw32 toolchain.")
@@ -29,9 +29,7 @@ FetchContent_MakeAvailable(minhook nlohmann_json)
 add_library(dd2_foveated_vrs SHARED
     src/plugin.cpp
     src/graphics.cpp
-    src/gpu_timer.cpp
     src/engine_optimizer.cpp
-    src/motion_blur_gpu.cpp
     src/platform.c)
 if(MINGW)
     enable_language(ASM)

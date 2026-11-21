@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 
@@ -116,15 +117,43 @@ template<class T> bool read_entry(const std::byte*& data, size_t& remaining, T& 
     return true;
 }
 
+// Stream ABI from DirectX-Headers. The supported Windows and MinGW SDKs
+// predate these subobjects, but newer runtimes can supply them.
+enum : uint32_t {
+    stream_depth_stencil2 = 26,
+    stream_rasterizer1 = 27,
+    stream_rasterizer2 = 28,
+    stream_serialized_root = 29,
+    stream_psdb = 30,
+};
+struct StreamStencilFace {
+    D3D12_DEPTH_STENCILOP_DESC ops;
+    UINT8 read_mask, write_mask;
+};
+struct StreamDepthStencil2 {
+    BOOL depth_enabled;
+    D3D12_DEPTH_WRITE_MASK depth_write;
+    D3D12_COMPARISON_FUNC depth_compare;
+    BOOL stencil_enabled;
+    StreamStencilFace front, back;
+    BOOL depth_bounds_enabled;
+};
+struct StreamSerializedRoot { const void* blob; SIZE_T size; };
+struct StreamPipelineDatabase { IUnknown* session; UINT flags; };
+using StreamRasterizer1 = std::array<uint32_t, 11>;
+using StreamRasterizer2 = std::array<uint32_t, 10>;
+static_assert(sizeof(StreamDepthStencil2) == 60);
+static_assert(sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) == sizeof(uint32_t));
+
 // Report incomplete stream metadata without guessing its shader identity.
-// An observed compute shader is sufficient to classify the stream as compute.
 inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
     PipelineInfo unsupported{};
     unsupported.rejection = Diagnostic::draw_stream;
     unsupported.source = PipelineSource::stream;
     auto* data = static_cast<const std::byte*>(desc.pPipelineStateSubobjectStream);
     size_t remaining = desc.SizeInBytes;
-    if (!data || remaining > 65536) return unsupported;
+    if (!data || remaining < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) || remaining > 65536)
+        return unsupported;
 
     D3D12_BLEND_DESC blend{};
     blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -135,16 +164,17 @@ inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
     D3D12_RT_FORMAT_ARRAY rt{};
     DXGI_FORMAT dsv{};
     DXGI_SAMPLE_DESC sample{1, 0};
-    D3D12_SHADER_BYTECODE ps{}, vs{}, cs{}, gs{}, hs{}, ds{};
+    D3D12_SHADER_BYTECODE ps{}, vs{}, cs{}, gs{}, hs{}, ds{}, as{}, ms{};
     D3D12_STREAM_OUTPUT_DESC stream_output{};
 
     while (remaining >= sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+        uint32_t type;
         std::memcpy(&type, data, sizeof(type));
 #define DD2_READ(name, value) case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##name: \
         if (!read_entry(data, remaining, value)) return unsupported; break
-#define DD2_SKIP(name, T) case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##name: { \
+#define DD2_SKIP_TYPE(type, T) case type: { \
         T ignored{}; if (!read_entry(data, remaining, ignored)) return unsupported; break; }
+#define DD2_SKIP(name, T) DD2_SKIP_TYPE(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##name, T)
         switch (type) {
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
             if (!read_entry(data, remaining, vs)) return unsupported;
@@ -154,14 +184,7 @@ inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
             if (!read_entry(data, remaining, ps)) return unsupported;
             if (ps.BytecodeLength) unsupported.kind = PipelineKind::graphics;
             break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-            if (!read_entry(data, remaining, cs)) return unsupported;
-            if (cs.BytecodeLength) {
-                unsupported.kind = PipelineKind::compute;
-                unsupported.cs_id = shader_header_id(cs);
-                return unsupported;
-            }
-            break;
+        DD2_READ(CS, cs);
         DD2_READ(BLEND, blend);
         DD2_READ(PRIMITIVE_TOPOLOGY, topology);
         DD2_READ(RENDER_TARGET_FORMATS, rt);
@@ -171,6 +194,8 @@ inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
         DD2_READ(DS, ds);
         DD2_READ(HS, hs);
         DD2_READ(GS, gs);
+        DD2_READ(AS, as);
+        DD2_READ(MS, ms);
         DD2_READ(STREAM_OUTPUT, stream_output);
         DD2_SKIP(SAMPLE_MASK, UINT);
         DD2_SKIP(RASTERIZER, D3D12_RASTERIZER_DESC);
@@ -179,6 +204,12 @@ inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
         DD2_SKIP(NODE_MASK, UINT);
         DD2_SKIP(CACHED_PSO, D3D12_CACHED_PIPELINE_STATE);
         DD2_SKIP(FLAGS, D3D12_PIPELINE_STATE_FLAGS);
+        DD2_SKIP(VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC);
+        // These rasterizer payloads occupy 11 and 10 32-bit fields respectively.
+        DD2_SKIP_TYPE(stream_rasterizer1, StreamRasterizer1);
+        DD2_SKIP_TYPE(stream_rasterizer2, StreamRasterizer2);
+        DD2_SKIP_TYPE(stream_serialized_root, StreamSerializedRoot);
+        DD2_SKIP_TYPE(stream_psdb, StreamPipelineDatabase);
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             D3D12_DEPTH_STENCIL_DESC state{};
             if (!read_entry(data, remaining, state)) return unsupported;
@@ -195,12 +226,31 @@ inline PipelineInfo classify(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
             comparison = state.DepthFunc;
             break;
         }
+        case stream_depth_stencil2: {
+            StreamDepthStencil2 state{};
+            if (!read_entry(data, remaining, state)) return unsupported;
+            depth = state.depth_enabled;
+            write = state.depth_write;
+            comparison = state.depth_compare;
+            break;
+        }
         default: return unsupported;
         }
 #undef DD2_SKIP
+#undef DD2_SKIP_TYPE
 #undef DD2_READ
     }
-    if (remaining || gs.BytecodeLength || hs.BytecodeLength || ds.BytecodeLength ||
+    if (remaining) return unsupported;
+    if (cs.BytecodeLength) {
+        unsupported.kind = PipelineKind::compute;
+        unsupported.cs_id = shader_header_id(cs);
+        return unsupported;
+    }
+    if (as.BytecodeLength || ms.BytecodeLength) {
+        unsupported.kind = PipelineKind::graphics;
+        return unsupported;
+    }
+    if (gs.BytecodeLength || hs.BytecodeLength || ds.BytecodeLength ||
         stream_output.NumEntries) return unsupported;
     return classify(blend, depth, write, comparison, rt, dsv, sample, topology,
         ps, vs, PipelineSource::stream);

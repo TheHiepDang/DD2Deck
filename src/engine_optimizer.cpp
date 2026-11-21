@@ -1,15 +1,15 @@
 #include "engine_optimizer.hpp"
 #include "graphics.hpp"
 
-#include <bit>
+#include <algorithm>
 #include <atomic>
-#include <cctype>
-#include <chrono>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,7 +23,14 @@ using Type = API::TypeDefinition;
 enum class Scalar { invalid, boolean, i8, u8, i16, u16, i32, u32, f32 };
 Scalar scalar(Type* type) {
     if (!type) return Scalar::invalid;
-    if (type->is_enum()) type = type->get_underlying_type();
+    if (type->is_enum()) {
+        // Use TDB metadata when available. Some native enums have a backing
+        // field but no usable System.RuntimeType for get_underlying_type().
+        auto* storage = type->find_field("value__");
+        auto* underlying = storage && !storage->is_static() ? storage->get_type() : nullptr;
+        type = underlying && underlying != type && !underlying->is_enum()
+            ? underlying : type->get_underlying_type();
+    }
     if (!type) return Scalar::invalid;
     const auto name = type->get_full_name();
     if (name == "System.Boolean") return Scalar::boolean;
@@ -93,9 +100,18 @@ Method* method(Type* type, std::initializer_list<const char*> names, unsigned ar
     return nullptr;
 }
 
+Method* inherited_method(Type* type, std::initializer_list<const char*> names, unsigned args = 0) {
+    for (auto* name : names) for (auto* base = type; base; base = base->get_parent_type())
+        if (auto* candidate = method(base, {name}, args); candidate && !candidate->is_static()) return candidate;
+    return nullptr;
+}
+
 bool invoke(Method* m, void* object, reframework::InvokeRet& ret, void* arg = nullptr, bool takes_arg = false) {
     return m && object && guarded([&] {
-        return API::get()->sdk()->method->invoke(*m, object, takes_arg ? &arg : nullptr,
+        // The C plugin table's invoke takes a raw this pointer. It uses the
+        // same TDB invocation as Lua sdk.call_native_func, for both owners.
+        const auto* methods = API::get()->sdk()->method;
+        return methods && methods->invoke && methods->invoke(*m, object, takes_arg ? &arg : nullptr,
             takes_arg ? sizeof(arg) : 0, &ret, sizeof(ret)) == REFRAMEWORK_ERROR_NONE && !ret.exception_thrown;
     });
 }
@@ -103,6 +119,31 @@ bool invoke(Method* m, void* object, reframework::InvokeRet& ret, void* arg = nu
 Object* object_call(Method* m, void* object, void* arg = nullptr, bool takes_arg = false) {
     reframework::InvokeRet ret{};
     return invoke(m, object, ret, arg, takes_arg) ? static_cast<Object*>(ret.ptr) : nullptr;
+}
+
+Type* managed_type(Object* object) {
+    Type* type{};
+    if (object) guarded([&] {
+        const auto* sdk = API::get()->sdk()->managed_object;
+        if (sdk->is_managed_object && !sdk->is_managed_object(object)) return false;
+        type = object->get_type_definition();
+        return type != nullptr;
+    });
+    return type;
+}
+
+Object* managed_instance(const API::TDB* db, const char* name) {
+    auto& api = API::get();
+    if (auto* instance = api->get_managed_singleton(name)) return instance;
+    auto* type = db ? db->find_type(name) : nullptr;
+    if (!type) return nullptr;
+    const auto short_name = std::string_view{name}.substr(std::string_view{name}.rfind('.') + 1);
+    const std::string getter_name = "get_s" + std::string(short_name);
+    auto* getter = method(type, {getter_name.c_str()});
+    if (!getter || !getter->is_static() || getter->get_return_type() != type) return nullptr;
+    reframework::InvokeRet out{};
+    return api->sdk()->method->invoke(*getter, nullptr, nullptr, 0, &out, sizeof(out)) == REFRAMEWORK_ERROR_NONE &&
+        !out.exception_thrown ? static_cast<Object*>(out.ptr) : nullptr;
 }
 
 std::optional<double> read_method(Method* m, void* object, Scalar kind) {
@@ -118,32 +159,96 @@ struct Access {
     explicit operator bool() const { return kind != Scalar::invalid; }
 };
 
-Access accessor(Type* type, std::initializer_list<const char*> getters,
-                std::initializer_list<const char*> setters, const char* field_name = nullptr) {
-    if (!type) return {};
-    auto* get = method(type, getters);
-    auto* set = method(type, setters, 1);
-    if (get && set && !get->is_static() && !set->is_static() && get->get_return_type()) {
+Access field_binding(Field* field, bool writable = false) {
+    const auto* sdk = API::get()->sdk()->field;
+    if (!field || !sdk || field->is_static() || (sdk->is_literal && field->is_literal())) return {};
+    constexpr unsigned init_only = 0x20; // System.Reflection.FieldAttributes.InitOnly
+    if (writable && sdk->get_flags && (field->get_flags() & init_only)) return {};
+    return {nullptr, nullptr, field, scalar(field->get_type())};
+}
+
+Method* scalar_setter(Type* type, std::initializer_list<const char*> names, Scalar kind) {
+    const auto matches = [kind](Method* set) {
+        if (!set || set->is_static() || set->get_num_params() != 1) return false;
         const auto args = set->get_params();
-        if (args.size() == 1 && args[0].t == static_cast<REFrameworkTypeDefinitionHandle>(*get->get_return_type())) {
-            const auto kind = scalar(get->get_return_type());
-            if (kind != Scalar::invalid) return {get, set, nullptr, kind};
+        return args.size() == 1 && scalar(reinterpret_cast<Type*>(args[0].t)) == kind;
+    };
+    for (const auto* name : names) for (auto* base = type; base; base = base->get_parent_type()) {
+        if (auto* set = base->find_method(name); matches(set)) return set;
+    }
+    // A bare-name lookup may select a different overload on a native type.
+    for (auto* base = type; base; base = base->get_parent_type()) {
+        for (auto* set : base->get_methods()) {
+            const auto* name = set ? set->get_name() : nullptr;
+            if (name && std::find(names.begin(), names.end(), std::string_view{name}) != names.end() &&
+                matches(set)) return set;
         }
     }
-    if (field_name)
-        if (auto* field = type->find_field(field_name); field && !field->is_static())
-            return {nullptr, nullptr, field, scalar(field->get_type())};
+    return nullptr;
+}
+
+Access accessor(Type* type, std::initializer_list<const char*> getters,
+                std::initializer_list<const char*> setters, std::initializer_list<const char*> fields = {}) {
+    for (auto* name : getters) {
+        auto* get = inherited_method(type, {name});
+        const auto kind = scalar(get ? get->get_return_type() : nullptr);
+        if (kind == Scalar::invalid) continue;
+        if (auto* set = scalar_setter(type, setters, kind)) return {get, set, nullptr, kind};
+    }
+    for (auto* name : fields) for (auto* base = type; base; base = base->get_parent_type()) {
+        auto* field = base->find_field(name);
+        auto binding = field_binding(field);
+        if (!binding) continue;
+        if (auto* set = scalar_setter(type, setters, binding.kind)) {
+            binding.set = set;
+            return binding;
+        }
+        if (field_binding(field, true)) return binding;
+    }
     return {};
 }
 
-std::optional<double> read(const Access& a, void* owner) {
-    if (a.get) return read_method(a.get, owner, a.kind);
+Access native_accessor(Type* type, const char* getter, std::initializer_list<const char*> setters) {
+    // Native render methods can carry the Static flag even though the Lua
+    // native binding supplies the singleton pointer. Match names and arity,
+    // and use the getter's scalar ABI without relying on setter type handles.
+    auto* get = method(type, {getter});
+    auto* set = method(type, setters, 1);
+    if (!get || !set) return {};
+    auto* result = get->get_return_type();
+    auto kind = scalar(result);
+    if (kind == Scalar::invalid && result && result->is_enum() && result->get_full_name().starts_with("via.render."))
+        kind = Scalar::i32;
+    return {get, set, nullptr, kind};
+}
+
+const char* scalar_name(Scalar kind) {
+    switch (kind) {
+    case Scalar::boolean: return "bool";
+    case Scalar::i8: return "i8";
+    case Scalar::u8: return "u8";
+    case Scalar::i16: return "i16";
+    case Scalar::u16: return "u16";
+    case Scalar::i32: return "i32";
+    case Scalar::u32: return "u32";
+    case Scalar::f32: return "f32";
+    default: return "invalid";
+    }
+}
+
+std::optional<double> read_field(Field* field, void* owner, Scalar kind) {
     std::optional<double> value;
-    if (a.field) guarded([&] {
-        value = number(a.kind, a.field->get_data_raw(owner));
+    if (field && owner) guarded([&] {
+        value = number(kind, field->get_data_raw(owner, false));
         return true;
     });
     return value;
+}
+
+std::optional<double> read(const Access& a, void* owner) {
+    if (const auto value = read_method(a.get, owner, a.kind)) return value;
+    if (const auto value = read_field(a.field, owner, a.kind)) return value;
+    return {};
 }
 
 bool write(const Access& a, void* owner, double value) {
@@ -164,7 +269,7 @@ bool write(const Access& a, void* owner, double value) {
 bool same(double a, double b) { return std::abs(a - b) <= 0.0001; }
 
 struct Change {
-    void* owner{};
+    uintptr_t owner{};
     double baseline{};
     std::optional<double> written;
     double retry{};
@@ -173,41 +278,43 @@ struct Change {
     void reconcile(void* current_owner, const Access& access, std::optional<double> value,
                    bool enable, double now) {
         if (!current_owner || !access || !value) return;
-        if (owner != current_owner) *this = {};
+        const auto identity = object_key(current_owner);
+        if (owner != identity) *this = {};
         // A game or another mod may have changed the value. Only undo a
         // value we still own. The external value becomes the next baseline.
         if (written && !same(*written, *value)) *this = {};
         if (!enable && !written) return;
         if (now < retry || (enable && failures >= 3)) return;
         if (!owner || !written) {
-            owner = current_owner;
+            owner = identity;
             baseline = *value;
         }
     }
 
-    void apply(const Access& access, double current, double target, bool enable, double now) {
-        if (now < retry || (enable && failures >= 3) || !owner) return;
+    bool apply(const Access& access, void* current_owner, double current, double target, bool enable, double now) {
+        if (!current_owner || object_key(current_owner) != owner || now < retry || (enable && failures >= 3)) return false;
         if (same(current, target)) {
             if (!enable) *this = {};
-            return;
+            return false;
         }
         const auto bits = pack(access.kind, target);
-        if (!bits) return;
+        if (!bits) return false;
         const auto expect = number(access.kind, &*bits);
-        if (!expect || same(current, *expect)) return;
-        const bool changed = write(access, owner, target);
-        const auto after = read(access, owner);
+        if (!expect || same(current, *expect)) return false;
+        const bool changed = write(access, current_owner, target);
+        const auto after = read(access, current_owner);
         if (after && same(*after, *expect)) {
             if (enable) {
                 written = *after;
                 failures = 0;
             } else *this = {};
-        } else {
-            if (after && !same(*after, baseline)) written = *after;
-            else if (changed && !after) written = *expect;
-            ++failures;
-            retry = now + 8.0;
+            return changed;
         }
+        if (after && !same(*after, baseline)) written = *after;
+        else if (changed && !after) written = *expect;
+        ++failures;
+        retry = now + (enable ? 8.0 : 0.05);
+        return false;
     }
 };
 
@@ -216,30 +323,34 @@ struct Spec {
     const char* type;
     Owner owner;
     std::initializer_list<const char*> get, set;
-    const char* field{};
+    std::initializer_list<const char*> fields;
 };
 const std::array<Spec, tweak_count> specs{{
     {"app.RenderingManager", Owner::managed, {"getSpeedTreeLODBias", "get_SpeedTreeLODBias", "get_SpeedTreeLodBias"},
-        {"setSpeedTreeLODBias", "set_SpeedTreeLODBias"}, "_SpeedTreeLodBias"},
-    {"app.LODProcessManager", Owner::managed, {}, {}, "MotionQuality"},
+        {"setSpeedTreeLODBias", "set_SpeedTreeLODBias"}, {"_SpeedTreeLodBias"}},
+    {"app.LODProcessManager", Owner::managed, {"get_MotionQuality", "getMotionQuality", "get_MotionLOD"},
+        {"set_MotionQuality", "setMotionQuality", "set_MotionLOD"}, {"_MotionQuality", "MotionQuality", "_MotionLOD"}},
     {"via.render.RenderConfig", Owner::config, {"get_ContactShadowSetting", "get_ContactShadows"},
-        {"set_ContactShadowSetting", "set_ContactShadows"}},
-    {"via.landscape.FoliageManager", Owner::native, {}, {}},
-    {"via.effect.EffectManager", Owner::native, {}, {}},
-    {"via.render.RenderConfig", Owner::config, {"get_ShadowQuality"}, {"set_ShadowQuality"}},
-    {"via.render.LightRenderer", Owner::native, {"get_ShadowResolution"}, {"set_ShadowResolution"}},
-    {"via.render.SSAOControl", Owner::component, {"get_HalfResolution"}, {"set_HalfResolution"}},
-    {"via.render.SSRControl", Owner::component, {"get_HalfResolution"}, {"set_HalfResolution"}}
+        {"set_ContactShadowSetting", "set_ContactShadows"}, {}},
+    {"via.render.RenderConfig", Owner::config, {"get_ShadowQuality"}, {"set_ShadowQuality"}, {}},
+    {"via.render.LightRenderer", Owner::native, {"get_ShadowResolution"}, {"set_ShadowResolution"}, {}},
+    {"via.render.SSAOControl", Owner::component, {"get_HalfResolution"}, {"set_HalfResolution"}, {}},
+    {"via.render.SSRControl", Owner::component, {"get_HalfResolution"}, {"set_HalfResolution"}, {}},
+    {"via.render.LightRenderer", Owner::native, {"get_ShadowFilter"}, {"set_ShadowFilter"}, {}},
+    {"via.render.SSRControl", Owner::component, {"get_Type"}, {"set_Type"}, {}},
+    {"via.render.SSRControl", Owner::component, {"get_ResolvePoint"}, {"set_ResolvePoint"}, {}},
+    {"via.render.SSAOControl", Owner::component, {"get_DFAO"}, {"set_DFAO"}, {}},
+    {"via.render.MPMR", Owner::native, {"get_OutOfViewStreaming"}, {"set_OutOfViewStreaming"}, {}},
+    {"via.render.MPMR", Owner::native, {"get_OutOfViewTextureStreaming"}, {"set_OutOfViewTextureStreaming"}, {}}
 }};
 
 const API::TDB* tdb{};
 std::array<Access, tweak_count> bindings{};
 std::array<Change, tweak_count> changes{};
 Baselines captured{}, snapshot_to_restore{};
-std::array<Owner, tweak_count> owners{};
-std::array<const char*, tweak_count> types{};
 std::array<const char*, tweak_count> properties{};
 std::array<double, tweak_count> discovery_retry{};
+std::array<std::string_view, tweak_count> native_binding_status{};
 Method* render_config_get{};
 Method* clock_hour{}, *clock_minute{};
 Scalar hour_kind{}, minute_kind{};
@@ -255,73 +366,93 @@ Object* component(Object* go, const char* name) {
     return type_object ? object_call(get, go, type_object, true) : nullptr;
 }
 
-void* owner(Owner kind, const char* type, Object* camera_go) {
+void* owner(const Spec& spec, Object* camera_go, const char** unavailable = nullptr) {
     auto& api = API::get();
-    switch (kind) {
-    case Owner::managed: return api->get_managed_singleton(type);
-    case Owner::native: return api->get_native_singleton(type);
-    case Owner::config:
-        if (!render_config_get) render_config_get = method(tdb->find_type("via.render.Renderer"), {"get_RenderConfig"});
-        return object_call(render_config_get, api->get_native_singleton("via.render.Renderer"));
-    case Owner::component: return component(camera_go, type);
+    switch (spec.owner) {
+    case Owner::managed:
+        return std::string_view(spec.type) == "app.LODProcessManager"
+            ? managed_instance(tdb, spec.type) : api->get_managed_singleton(spec.type);
+    case Owner::native: {
+        auto* instance = api->get_native_singleton(spec.type);
+        if (!instance && unavailable) *unavailable = "native_singleton_unavailable";
+        return instance;
+    }
+    case Owner::config: {
+        if (!render_config_get) {
+            // Resolve the native getter exactly as Lua does, regardless of
+            // the instance/static flag on the TDB method.
+            render_config_get = method(tdb->find_type("via.render.Renderer"), {"get_RenderConfig"});
+        }
+        auto* renderer = api->get_native_singleton("via.render.Renderer");
+        const auto* result = render_config_get ? render_config_get->get_return_type() : nullptr;
+        const bool returns_reference = result && !result->is_valuetype();
+        if (returns_reference) {
+            reframework::InvokeRet out{};
+            if (invoke(render_config_get, renderer, out) && out.ptr) return out.ptr;
+        }
+        if (auto* config = api->get_native_singleton(spec.type)) return config;
+        if (unavailable) {
+            *unavailable = !renderer ? "renderer_singleton_unavailable" :
+                !render_config_get ? "renderer_config_getter_unavailable" :
+                !returns_reference ? "renderer_config_return_type_unsupported" : "renderer_config_read_failed";
+        }
+        return nullptr;
+    }
+    case Owner::component: return component(camera_go, spec.type);
     }
     return nullptr;
 }
 
-bool contains(std::string_view p, std::string_view term) { return p.find(term) != p.npos; }
-
-bool property_candidate(std::string_view p, bool foliage_property) {
-    if (foliage_property) {
-        if (contains(p, "shadow") || contains(p, "raytrac") || contains(p, "collision")) return false;
-        return (contains(p, "grass") || contains(p, "foliage") || contains(p, "groundcover") ||
-                contains(p, "vegetation")) &&
-            (p.ends_with("culldistance") || p.ends_with("cullingdistance") ||
-             p.ends_with("drawdistance") || p.ends_with("renderdistance") || p.ends_with("lodbias"));
+void bind(size_t index, Object* go, double now) {
+    const auto& spec = specs[index];
+    const bool native = spec.owner == Owner::native || spec.owner == Owner::config;
+    const auto report = [&](const char* result, const Access& access = {}) {
+        if (!native) return;
+        if (native_binding_status[index] == result) return;
+        native_binding_status[index] = result;
+        if (access) {
+            auto* type = access.get->get_return_type();
+            API::get()->log_info("[DD2 VRS] Native binding %s.%s | %s setter=%s return=%s scalar=%s static=%u/%u",
+                spec.type, access.get->get_name(), result, access.set->get_name(),
+                type ? type->get_full_name().c_str() : "unknown", scalar_name(access.kind),
+                unsigned(access.get->is_static()), unsigned(access.set->is_static()));
+        } else {
+            API::get()->log_info("[DD2 VRS] Native binding %s.%s | %s", spec.type, *spec.get.begin(), result);
+        }
+    };
+    if (bindings[index]) {
+        report("resolved", bindings[index]);
+        return;
     }
-    return (contains(p, "effect") || contains(p, "particle")) &&
-           (contains(p, "lod") || contains(p, "quality") || contains(p, "cull"));
-}
+    if (now < discovery_retry[index]) return;
+    discovery_retry[index] = now + 8.0;
+    auto* definition = tdb->find_type(spec.type);
+    if (!definition) {
+        report("type_unavailable");
+        return;
+    }
 
-bool discover(size_t index, Owner kind, const char* type, Object* go) {
-    auto* obj = owner(kind, type, go);
-    auto* definition = tdb->find_type(type);
-    if (!obj || !definition) return false;
-    for (auto* m : definition->get_methods()) {
-        if (!m || !m->get_name()) continue;
-        const std::string_view name{m->get_name()};
-        if (!name.starts_with("get_")) continue;
-        std::string property{name.substr(4)};
-        std::transform(property.begin(), property.end(), property.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (!property_candidate(property, index == foliage)) continue;
-        const std::string setter = "set_" + std::string(name.substr(4));
-        const auto a = accessor(definition, {name.data()}, {setter.c_str()});
-        const auto baseline = a && a.kind != Scalar::boolean ? read(a, obj) : std::nullopt;
-        if (!baseline || (index == foliage && (*baseline < 1 || *baseline > 20000))) continue;
-        bindings[index] = a;
-        properties[index] = m->get_name();
-        owners[index] = kind;
-        types[index] = type;
+    void* object{};
+    const char* unavailable = "compatible_accessor_unavailable";
+    const auto try_access = [&](const Access& access) {
+        if (!access || boolean_tweak(index) != (access.kind == Scalar::boolean)) return false;
+        if (!object) object = owner(spec, go, &unavailable);
+        if (!object) return false;
+        if (!read(access, object)) {
+            unavailable = "getter_read_failed";
+            return false;
+        }
+        bindings[index] = access;
+        properties[index] = access.get ? access.get->get_name() : access.field->get_name();
+        report("resolved", access);
         return true;
-    }
-    return false;
-}
-
-void bind(size_t i, Object* go, double now) {
-    if (bindings[i] || now < discovery_retry[i]) return;
-    discovery_retry[i] = now + 8.0;
-    auto& spec = specs[i];
-    if (i == foliage) {
-        discover(i, Owner::native, spec.type, go) || discover(i, Owner::native, "via.render.FoliageManager", go) ||
-            discover(i, Owner::managed, "app.RenderingManager", go);
-    } else if (i == effects) {
-        discover(i, Owner::native, spec.type, go) || discover(i, Owner::config, "via.render.RenderConfig", go);
-    } else {
-        bindings[i] = accessor(tdb->find_type(spec.type), spec.get, spec.set, spec.field);
-        owners[i] = spec.owner;
-        types[i] = spec.type;
-        if (bindings[i]) properties[i] = bindings[i].get ? bindings[i].get->get_name() : spec.field;
-    }
+    };
+    for (auto* getter : spec.get)
+        if (try_access(native ? native_accessor(definition, getter, spec.set)
+                              : accessor(definition, {getter}, spec.set))) return;
+    for (auto* field : spec.fields)
+        if (try_access(accessor(definition, {}, spec.set, {field}))) return;
+    report(unavailable);
 }
 
 double target(size_t i, const EngineSettings& e, double baseline) {
@@ -329,10 +460,13 @@ double target(size_t i, const EngineSettings& e, double baseline) {
     case speedtree: return std::max(baseline, double(std::round(e.speedtree_bias)));
     case motion_quality: return std::min(baseline, double(std::round(e.motion_target)));
     case contact_shadows: return 2;
-    case foliage: return baseline < 10 ? std::min(5.0, baseline + 1.5) :
-        std::max(50.0, std::min(baseline, std::round(baseline * e.foliage_retention / 100.0)));
-    case effects: return std::max(0.0, baseline - 1.0);
     case shadow_quality: return std::min(baseline, double(std::round(e.shadow_target)));
+    case ssr_disable: return 1; // SSRControlType::Disable
+    case shadow_filter: // ShadowFilter::Custom
+    case ssr_low_resolve: // SSRResolvePointNum::_1
+    case dfao_disable:
+    case oov_streaming_off:
+    case oov_texture_streaming_off: return 0;
     case shadow_resolution: {
         if (shadow_sizes.empty()) {
             if (auto* type = tdb->find_type("via.render.ShadowResolution")) {
@@ -373,186 +507,24 @@ void poll_clock(const EngineSettings& e, double now) {
     state.night = state.clock_valid && is_night(state.hour, e.night_start, e.night_end);
 }
 
-struct NpcBinding {
-    const char* manager{};
-    Method* list{};
-    Field* list_field{};
-    size_t cursor{};
-    double retry{};
-} npcs;
-
-struct PositionBinding { Type* type{}; Method* method{}; };
-std::array<PositionBinding, 16> position_bindings{};
-struct ActorBinding { Type* type{}; Method* is_player{}, *is_pawn{}, *game_object{}; bool verified{}; };
-std::array<ActorBinding, 16> actor_bindings{};
-struct ListBinding { Type* type{}; Method* count{}, *item{}; Scalar count_kind{}; bool verified{}; } list_binding;
-Type* motion_type{};
-Access motion_rate{};
-
-struct Throttled {
-    Object* actor{}, *transform{}, *motion{};
-    Access update_rate;
-    Change value;
-};
-std::array<Throttled, 8> throttled;
-
-Object* actor_list(NpcBinding& binding, double now, std::initializer_list<const char*> managers,
-                   std::initializer_list<const char*> getters, std::initializer_list<const char*> fields) {
-    if (!binding.manager && now >= binding.retry) {
-        binding.retry = now + 8.0;
-        for (const char* name : managers) {
-            auto* type = tdb->find_type(name);
-            if (!type) continue;
-            if (!API::get()->get_managed_singleton(name)) continue;
-            auto* get = method(type, getters);
-            if (get && (get->is_static() || !get->get_return_type() || get->get_return_type()->is_valuetype())) get = nullptr;
-            Field* field{};
-            for (auto* candidate : fields) {
-                field = type->find_field(candidate);
-                if (field && !field->is_static() && field->get_type() && !field->get_type()->is_valuetype()) break;
-                field = nullptr;
-            }
-            if (!get && !field) continue;
-            binding.manager = name;
-            binding.list = get;
-            binding.list_field = field;
-            break;
-        }
-    }
-    if (!binding.manager) return nullptr;
-    auto* m = API::get()->get_managed_singleton(binding.manager);
-    if (binding.list) if (auto* list = object_call(binding.list, m)) return list;
-    const auto* data = m && binding.list_field ? binding.list_field->get_data_raw(m) : nullptr;
-    return data ? unpack<Object*>(data) : nullptr;
-}
-
-Object* npc_list(double now) {
-    return actor_list(npcs, now, {"app.NPCManager", "app.NpcManager", "app.CharacterManager"},
-        {"get_NpcList", "get_NPCList", "get_ActiveNpcList"}, {"_NpcList", "_NPCList"});
-}
-
-size_t list_size(Object* list, ListBinding& binding) {
-    if (!list) return 0;
-    auto* type = list->get_type_definition();
-    if (binding.type != type) {
-        binding = {type, method(type, {"get_Count"}), method(type, {"get_Item"}, 1)};
-        if (binding.count && binding.item && !binding.count->is_static() && !binding.item->is_static()) {
-            const auto args = binding.item->get_params();
-            binding.count_kind = scalar(binding.count->get_return_type());
-            binding.verified = args.size() == 1 && scalar(reinterpret_cast<Type*>(args[0].t)) == Scalar::i32 &&
-                binding.item->get_return_type() && !binding.item->get_return_type()->is_valuetype();
-        }
-    }
-    const auto n = binding.verified ? read_method(binding.count, list, binding.count_kind) : std::nullopt;
-    return n && *n > 0 && *n <= 4096 ? size_t(*n) : 0;
-}
-
-bool vector_position(Object* transform, V3& value) {
-    if (!transform) return false;
-    auto* type = transform->get_type_definition();
-    auto& binding = position_bindings[(reinterpret_cast<uintptr_t>(type) >> 4) % position_bindings.size()];
-    if (binding.type != type) {
-        binding = {type};
-        if (auto* m = method(type, {"get_Position"}); m && m->get_return_type()) {
-            const auto name = m->get_return_type()->get_full_name();
-            if (name == "via.vec3" || name == "via.Vec3" || name == "via.Vector3") binding.method = m;
-        }
-    }
-    reframework::InvokeRet out{};
-    if (!invoke(binding.method, transform, out)) return false;
-    value = unpack<V3>(out.bytes.data());
-    return std::all_of(value.begin(), value.end(), [](float x) { return std::isfinite(x); });
-}
-
-bool behind(const Camera& camera, Object* transform, float dot, float distance) {
-    V3 p{};
-    if (!camera.valid || !vector_position(transform, p)) return false;
-    for (size_t i = 0; i < p.size(); ++i) p[i] -= camera.position[i];
-    const float length = std::hypot(p[0], p[1], p[2]);
-    return length > distance &&
-           (p[0] * camera.forward[0] + p[1] * camera.forward[1] + p[2] * camera.forward[2]) < length * dot;
-}
-
-void release(Throttled& entry) {
-    entry.motion->release();
-    entry.transform->release();
-    entry.actor->release();
-    entry = {};
-}
-
-void update_npcs(const EngineSettings& e, const Camera& camera, bool enable, double now) {
-    // Check already-throttled actors before acquiring that frame's quarter.
-    // This lets camera turns restore visible actors without waiting a cycle.
-    for (auto& entry : throttled) if (entry.actor) {
-        guarded([&] {
-            if (enable && behind(camera, entry.transform, e.npc_dot + 0.10f, e.npc_distance))
-                return true;
-            const auto value = read(entry.update_rate, entry.motion);
-            entry.value.reconcile(entry.motion, entry.update_rate, value, false, now);
-            if (value && entry.value.written)
-                entry.value.apply(entry.update_rate, *value, entry.value.baseline, false, now);
-            if (!entry.value.written) release(entry);
-            return true;
-        });
-    }
-    if (!enable || !camera.valid) return;
-    auto* list = npc_list(now);
-    if (!list) return;
-    const size_t length = list_size(list, list_binding);
-    if (!length) return;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
-    for (size_t i = 0; i < (length + 3) / 4; ++i) {
-        if (i && std::chrono::steady_clock::now() >= deadline) break;
-        const auto index = npcs.cursor++ % length;
-        auto free = std::find_if(throttled.begin(), throttled.end(), [](const auto& e) { return !e.actor; });
-        if (free == throttled.end()) break;
-        guarded([&] {
-            auto* actor = object_call(list_binding.item, list, reinterpret_cast<void*>(index), true);
-            if (!actor || std::any_of(throttled.begin(), throttled.end(),
-                                      [&](const auto& e) { return e.actor == actor; })) return true;
-            auto* def = actor->get_type_definition();
-            auto& binding = actor_bindings[(reinterpret_cast<uintptr_t>(def) >> 4) % actor_bindings.size()];
-            if (binding.type != def) {
-                binding = {def, method(def, {"get_IsPlayer", "get_IsPlayerCharacter"}),
-                    method(def, {"get_IsPawn", "get_IsPawnCharacter"}), method(def, {"get_GameObject"})};
-                binding.verified = binding.is_player && binding.is_pawn && binding.game_object &&
-                    scalar(binding.is_player->get_return_type()) == Scalar::boolean &&
-                    scalar(binding.is_pawn->get_return_type()) == Scalar::boolean;
-            }
-            // Role checks must both resolve. A mixed list or an unidentified
-            // actor cannot receive a motion change.
-            if (!binding.verified || read_method(binding.is_player, actor, Scalar::boolean) != 0.0 ||
-                read_method(binding.is_pawn, actor, Scalar::boolean) != 0.0) return true;
-            auto* go = object_call(binding.game_object, actor);
-            auto* transform = go ? object_call(method(go->get_type_definition(), {"get_Transform"}), go) : nullptr;
-            if (!behind(camera, transform, e.npc_dot, e.npc_distance)) return true;
-            auto* motion = component(go, "via.motion.Motion");
-            if (!motion) return true;
-            auto* motion_def = motion->get_type_definition();
-            if (motion_def != motion_type) {
-                motion_type = motion_def;
-                motion_rate = accessor(motion_def, {"get_UpdateRate"}, {"set_UpdateRate"});
-            }
-            const auto access = motion_rate;
-            // Only a verified floating-point motion update rate is eligible.
-            if (access.kind != Scalar::f32) return true;
-            const auto rate = read(access, motion);
-            if (!rate || *rate <= 0.0 || *rate > 240.0) return true;
-            state.npc_bindings = true;
-            actor->add_ref();
-            transform->add_ref();
-            motion->add_ref();
-            *free = {actor, transform, motion, access, {}};
-            free->value.reconcile(motion, access, rate, true, now);
-            free->value.apply(access, *rate, *rate * 0.5, true, now);
-            if (!free->value.written) release(*free);
-            return true;
-        });
-    }
-}
+struct CombatBinding {
+    const API::TDB* db{};
+    Method* getter{};
+    const char* source{};
+} combat_binding;
+struct GameplayBinding {
+    const API::TDB* db{};
+    Type* character{}, *game_object_type{}, *player_type{};
+    Method* getter{}, *load_gui{}, *valid{}, *game_object{};
+    Field* field{};
+} gameplay_binding;
+uintptr_t loading_player{};
+const API::TDB* loading_tdb{};
+constexpr double world_grace_seconds = 2.0;
+double world_ready_at{}, last_world_update{};
 
 // Rule changes can arrive on an engine thread. Defer all reads and writes to
-// BeginRendering so a post-hook cannot race baseline restoration.
+// UpdateBehavior so a post-hook cannot race baseline restoration.
 std::atomic<bool> rules_changed{};
 void on_generate_rule(void**, REFrameworkTypeDefinitionHandle, unsigned long long) {
     rules_changed.store(true, std::memory_order_release);
@@ -566,20 +538,18 @@ constexpr std::array cap_fields{"_NPCGenerateLimit", "_RuleNPCGenerateLimit",
 
 struct GenerationCaps {
     std::array<Access, cap_count> fields{};
-    Object* owner{};
+    uintptr_t owner{};
     CapValues baseline{}, written{};
     bool owned{}, ready{}, initialized{};
 } caps;
 CrowdController crowd;
 Method* gui_pause{};
 double next_caps{}, next_crowd_bind{}, last_crowd_frame{};
-unsigned crowd_frames{};
 bool crowd_running{}, rule_hook_checked{};
 std::vector<Method*> hooked_rules;
 
 Access field_access(Type* type, const char* name) {
-    auto* f = type ? type->find_field(name) : nullptr;
-    return f && !f->is_static() ? Access{nullptr, nullptr, f, scalar(f->get_type())} : Access{};
+    return type ? field_binding(type->find_field(name)) : Access{};
 }
 
 void bind_crowd(double now, bool enable) {
@@ -644,16 +614,47 @@ bool commit_caps(Object* owner, const CapValues& current, const CapValues& desir
 }
 
 void update_caps(const CrowdSettings& s, bool enable, double now) {
-    if (!enable && !caps.owned && !caps.initialized) return;
-    const bool dirty = rules_changed.exchange(false, std::memory_order_acq_rel);
-    if (!dirty && now < next_caps) return;
-    next_caps = now + 0.5;
-    if (!caps.ready) return;
+    auto& live = state.crowd;
+    if (crowd_running != enable) {
+        crowd = {};
+        if (enable && caps.initialized) crowd.set_limits(s, caps.baseline[0], caps.baseline[2]);
+        last_crowd_frame = next_caps = 0;
+        crowd_running = enable;
+    }
+    const bool dirty = rules_changed.load(std::memory_order_relaxed) &&
+        rules_changed.exchange(false, std::memory_order_acq_rel);
+    const bool due = dirty || now >= next_caps;
+    if (enable && due) {
+        const auto paused = read_method(gui_pause, API::get()->get_managed_singleton("app.GuiManager"), Scalar::boolean);
+        live.paused = paused != 0.0;
+        live.pause_available = paused.has_value();
+    } else if (!enable) {
+        live.paused = live.pause_available = false;
+    }
+    if (enable && !live.paused) {
+        if (last_crowd_frame > 0) crowd.observe(now - last_crowd_frame, s);
+        last_crowd_frame = now;
+    } else {
+        last_crowd_frame = 0;
+        crowd.headroom_seconds = 0;
+    }
+    live.fps = crowd.fps;
+    live.average = crowd.average;
+    live.minimum = crowd.minimum;
+    live.maximum = crowd.maximum;
+    live.adjustments = crowd.adjustments;
+    live.mode = crowd.mode;
+    live.owned = caps.owned;
+    live.restoring = !enable && caps.owned;
+    if ((!enable && !caps.owned && !caps.initialized) || !due) return;
+    next_caps = now + (enable ? 0.5 : 0.05);
+    if (!caps.ready || live.paused) return;
     auto* owner = API::get()->get_managed_singleton(generate_manager);
     if (!owner) return;
-    if (caps.owner != owner) {
-        caps.owner = owner;
+    if (const auto key = object_key(owner); caps.owner != key) {
+        caps.owner = key;
         caps.owned = caps.initialized = false;
+        live.owned = live.restoring = false;
     }
     const auto readback = read_caps(owner);
     state.crowd.caps_ready = readback.has_value();
@@ -663,359 +664,227 @@ void update_caps(const CrowdSettings& s, bool enable, double now) {
     else for (size_t i = 0; i < current.size(); ++i)
         if (current[i] != caps.written[i]) caps.baseline[i] = current[i];
     if (enable && !caps.initialized) {
-        crowd.set_limits(s, caps.baseline[2]);
+        crowd.set_limits(s, caps.baseline[0], caps.baseline[2]);
         caps.initialized = true;
     }
+    crowd.vanilla_npc = caps.baseline[0];
+    if (!s.manual_npc_limit) crowd.npc = crowd.clamp_npc(s, crowd.npc);
     state.crowd.vanilla_npc = caps.baseline[0];
     state.crowd.vanilla_pawn = caps.baseline[2];
     auto target = caps.baseline;
-    if (enable && s.npc) target[0] = target[1] = s.manual_npc_limit ? s.manual_npc_limit :
-        std::clamp(crowd.npc, s.npc_min, s.npc_max);
+    if (enable && s.npc) {
+        target[0] = s.manual_npc_limit ? s.manual_npc_limit : crowd.npc;
+        target[1] = s.manual_npc_limit ? s.manual_npc_limit : std::min(target[0], caps.baseline[1]);
+    }
     if (enable && s.pawn) target[2] = std::clamp(crowd.pawn, s.pawn_min, s.pawn_max);
     if (enable && (s.npc || s.pawn))
         target[3] = int(std::min<int64_t>(int64_t(target[0]) + target[2], INT32_MAX));
     state.crowd.cap_write_failed = !commit_caps(owner, current, target);
-    if (state.crowd.cap_write_failed) { next_caps = now + 8.0; return; }
+    if (state.crowd.cap_write_failed) {
+        next_caps = now + (enable ? 8.0 : 0.05);
+        return;
+    }
     state.crowd.npc = target[0];
     state.crowd.pawn = target[2];
     caps.written = target;
     caps.owned = target != caps.baseline;
+    live.owned = caps.owned;
+    live.restoring = !enable && caps.owned;
     if (!enable) caps.initialized = false;
 }
 
-struct HeldObject {
-    Object* ptr{};
-    HeldObject() = default;
-    HeldObject(const HeldObject&) = delete;
-    HeldObject& operator=(const HeldObject&) = delete;
-    HeldObject(HeldObject&& other) noexcept : ptr(std::exchange(other.ptr, nullptr)) {}
-    HeldObject& operator=(HeldObject&& other) noexcept {
-        if (this != &other) { reset(); ptr = std::exchange(other.ptr, nullptr); }
-        return *this;
-    }
-    ~HeldObject() { reset(); }
-    void reset(Object* obj = nullptr) {
-        if (ptr == obj) return;
-        if (ptr) guarded([&] { ptr->release(); return true; });
-        ptr = nullptr;
-        if (obj) guarded([&] { obj->add_ref(); ptr = obj; return true; });
-    }
-};
-
-constexpr unsigned entity_kind_count = 4;
-struct EntityBinding {
-    Type* type{};
-    Method* distance{}, *game_object{};
-    Access distance_field;
-    Scalar distance_kind{};
-    std::array<Method*, 3> lod{};
-    std::array<Field*, 3> lod_fields{};
-};
-struct Part {
-    HeldObject target;
-    Access access;
-    Change change;
-    bool looked_up{};
-};
-struct ScopedEntity {
-    HeldObject actor;
-    std::array<Part, entity_kind_count> parts;
-    unsigned seen{};
-};
-std::array<EntityBinding, 32> entity_bindings{};
-struct PartBinding { Type* type{}; Access access; };
-std::array<std::array<PartBinding, 16>, entity_kind_count> part_bindings{};
-std::vector<ScopedEntity> entities;
-std::array<NpcBinding, 3> distance_lists{};
-std::array<ListBinding, 3> distance_list_types{};
-std::array<Object*, 3> list_identities{};
-unsigned sweep{}, source_index{}, list_index{};
-size_t restore_cursor{};
-double last_sweep{};
-bool scanning{};
-Status::Crowd sweep_status;
-
-Object* distance_list(unsigned source, double now) {
-    switch (source) {
-    case 0: return actor_list(distance_lists[0], now, {"app.EnemyManager"}, {"get_EnemyList"}, {"_EnemyList"});
-    case 1: return npc_list(now);
-    default: return actor_list(distance_lists[2], now, {"app.PawnManager", "app.CharacterManager"},
-        {"get_StrayPawnList", "get_ActiveStrayPawnList"}, {"_StrayPawnList", "_ActiveStrayPawnList"});
-    }
+bool derives_from(Type* type, Type* base) {
+    if (!base) return false;
+    for (unsigned i = 0; type && i < 64; ++i, type = type->get_parent_type())
+        if (type == base) return true;
+    return false;
 }
 
-EntityBinding& entity_binding(Object* actor) {
-    auto* type = actor->get_type_definition();
-    auto& b = entity_bindings[(reinterpret_cast<uintptr_t>(type) >> 4) % entity_bindings.size()];
-    if (!type || b.type == type) return b;
-    b = {};
-    b.type = type;
-    b.distance = method(type, {"get_DistanceSqFromPlayer", "getDistanceSqFromPlayer"});
-    if (b.distance && !b.distance->is_static()) b.distance_kind = scalar(b.distance->get_return_type());
-    b.distance_field = field_access(type, "<DistanceSqFromPlayer>k__BackingField");
-    if (!b.distance_field) b.distance_field = field_access(type, "_DistanceSqFromPlayer");
-    b.game_object = method(type, {"get_GameObject"});
-    constexpr const char* names[]{"FacialLOD", "JointConstraintsLOD", "UpperBodyTransformerLOD"};
-    for (size_t i = 0; i < b.lod.size(); ++i) {
-        const std::string name = names[i];
-        auto* getter = method(type, {("get_" + name).c_str()});
-        if (getter && !getter->is_static() && getter->get_return_type() && !getter->get_return_type()->is_valuetype())
-            b.lod[i] = getter;
-        for (const std::string& field_name : {name, "<" + name + ">k__BackingField"}) {
-            auto* f = type->find_field(field_name.c_str());
-            if (f && !f->is_static() && f->get_type() && !f->get_type()->is_valuetype()) {
-                b.lod_fields[i] = f;
-                break;
-            }
-        }
-    }
-    return b;
+void update_crowd(const CrowdSettings& settings, bool enable, double now) {
+    if (!enable && !caps.owned && !caps.initialized && !crowd_running) return;
+    bind_crowd(now, enable);
+    update_caps(settings, enable, now);
 }
-
-Access lod_access(Type* type, unsigned part) {
-    if (!type) return {};
-    if (part == 3) {
-        auto a = accessor(type, {"get_FreezeRate", "getFreezeRate"}, {"set_FreezeRate", "setFreezeRate"});
-        return a.kind == Scalar::f32 ? a : Access{};
+void report_tweaks() {
+    state.active_tweaks = int(std::count_if(changes.begin(), changes.end(), [](const auto& x) { return x.written.has_value(); }));
+    state.camera_tweaks_active = changes[ssao_half].written || changes[ssr_half].written ||
+        changes[ssr_disable].written || changes[ssr_low_resolve].written || changes[dfao_disable].written;
+    state.pending_snapshot = int(std::count_if(snapshot_to_restore.begin(), snapshot_to_restore.end(),
+        [](const auto& x) { return x.has_value(); }));
+    state.properties = properties;
+    for (size_t i = 0; i < changes.size(); ++i) {
+        const auto& change = changes[i];
+        state.tweak_status[i] = change.failures ? "Write/readback failed" : change.written ? "Applied" :
+            bindings[i] ? "Ready" : discovery_retry[i] > 0 ? "Binding unavailable" : "Waiting for engine";
     }
-    const auto getters = part == 0 ? std::initializer_list<const char*>{"get_IsEnableFacial", "get_EnableFacial", "isEnableFacial"} :
-        std::initializer_list<const char*>{"get_IsEnable", "get_Enable", "getIsEnable", "isEnable"};
-    const auto setters = part == 0 ? std::initializer_list<const char*>{"setEnableFacial"} :
-        std::initializer_list<const char*>{"setEnable"};
-    const auto a = accessor(type, getters, setters);
-    if (a.kind == Scalar::boolean) return a;
-    // Some RE Engine builds expose a setter and a backing boolean only.
-    // The field is used for readback. The engine setter still owns writes.
-    auto* set = method(type, setters, 1);
-    if (!set || set->is_static()) return {};
-    const auto params = set->get_params();
-    if (params.size() != 1 || scalar(reinterpret_cast<Type*>(params[0].t)) != Scalar::boolean) return {};
-    const auto fields = part == 0 ? std::initializer_list<const char*>{"IsEnableFacial", "_IsEnableFacial", "<IsEnableFacial>k__BackingField"} :
-        std::initializer_list<const char*>{"IsEnable", "_IsEnable", "<IsEnable>k__BackingField"};
-    for (auto* name : fields) {
-        const auto f = field_access(type, name);
-        if (f.kind == Scalar::boolean) return {nullptr, set, f.field, f.kind};
-    }
-    return {};
-}
-
-void update_part(Part& part, std::optional<double> target, double now) {
-    if (!part.target.ptr || !part.access || (!target && !part.change.written)) return;
-    const auto value = read(part.access, part.target.ptr);
-    part.change.reconcile(part.target.ptr, part.access, value, target.has_value(), now);
-    if (value && (target || part.change.written))
-        part.change.apply(part.access, *value, target.value_or(part.change.baseline), target.has_value(), now);
-}
-
-void visit_entity(Object* actor, const CrowdSettings& settings, double now) {
-    if (!actor) return;
-    auto found = std::find_if(entities.begin(), entities.end(), [&](const auto& e) { return e.actor.ptr == actor; });
-    if (found != entities.end() && found->seen == sweep) return;
-    const auto& b = entity_binding(actor);
-    if (!b.type) return;
-    auto distance = read_method(b.distance, actor, b.distance_kind);
-    if (!distance) distance = read(b.distance_field, actor);
-    if (!distance || *distance < 0.0) return;
-    ++sweep_status.processed;
-    const float dsq = float(*distance);
-    const float freeze = settings.chain ? chain_freeze(dsq, settings) : 0.0f;
-    const std::array targets{settings.lod && dsq > settings.facial_distance * settings.facial_distance,
-                             settings.lod && dsq > settings.joint_distance * settings.joint_distance,
-                             settings.lod && dsq > settings.upper_distance * settings.upper_distance,
-                             freeze > 0.0f};
-    if (found == entities.end()) {
-        if (entities.size() >= 256 || std::none_of(targets.begin(), targets.end(), [](bool x) { return x; })) return;
-        entities.emplace_back();
-        found = std::prev(entities.end());
-        found->actor.reset(actor);
-        if (!found->actor.ptr) { entities.pop_back(); return; }
-    }
-    found->seen = sweep;
-    for (unsigned i = 0; i < found->parts.size(); ++i) {
-        auto& part = found->parts[i];
-        if (targets[i] && !part.looked_up) {
-            Object* object = nullptr;
-            if (i == 3) object = component(object_call(b.game_object, actor), "via.motion.Chain");
-            else {
-                object = object_call(b.lod[i], actor);
-                if (!object && b.lod_fields[i]) {
-                    if (const auto* raw = b.lod_fields[i]->get_data_raw(actor)) object = unpack<Object*>(raw);
-                }
-            }
-            if (object) {
-                auto* type = object->get_type_definition();
-                auto& by_type = part_bindings[i];
-                auto& binding = by_type[(reinterpret_cast<uintptr_t>(type) >> 4) % by_type.size()];
-                if (binding.type != type) binding = {type, lod_access(type, i)};
-                part.access = binding.access;
-                if (part.access) part.target.reset(object);
-            }
-            part.looked_up = true;
-        }
-        if (part.target.ptr) sweep_status.bound_lods |= 1u << i;
-        const auto target = targets[i] ? std::optional<double>{i == 3 ? freeze : 0.0} : std::nullopt;
-        update_part(part, target, now);
-        if (!part.change.written) continue;
-        if (i == 0) ++sweep_status.facial;
-        if (i == 1) ++sweep_status.joint;
-        if (i == 2) ++sweep_status.upper;
-        if (i == 3 && *part.change.written >= 1.0) ++sweep_status.frozen;
-        if (i == 3 && *part.change.written < 1.0) ++sweep_status.partial;
-    }
-}
-
-void update_entities(const CrowdSettings& s, bool enable, double now) {
-    if (!enable || (!s.lod && !s.chain)) scanning = false;
-    if (!scanning && entities.empty() && (!enable || (!s.lod && !s.chain))) {
-        state.crowd.processed = state.crowd.facial = state.crowd.joint = state.crowd.upper = 0;
-        state.crowd.partial = state.crowd.frozen = 0;
-        return;
-    }
-    if (enable && (s.lod || s.chain) && !scanning && crowd_frames >= unsigned(s.lod_interval)) {
-        crowd_frames = 0;
-        scanning = true;
-        source_index = list_index = 0;
-        list_identities = {};
-        ++sweep;
-        sweep_status = {};
-    }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(150);
-    unsigned work = 0;
-    while (scanning && source_index < distance_lists.size() && work < 16 && std::chrono::steady_clock::now() < deadline) {
-        const auto source = source_index;
-        auto* list = distance_list(source, now);
-        auto& binding = distance_list_types[source];
-        const auto size = list_size(list, binding);
-        if (list && binding.verified) sweep_status.list_sources |= 1u << source;
-        if (list != list_identities[source]) { list_index = 0; list_identities[source] = list; }
-        while (list_index < size && work++ < 16) {
-            guarded([&] {
-                visit_entity(object_call(binding.item, list, reinterpret_cast<void*>(uintptr_t(list_index)), true), s, now);
-                return true;
-            });
-            ++list_index;
-            if (std::chrono::steady_clock::now() >= deadline) break;
-        }
-        if (list_index < size) break;
-        ++source_index;
-        list_index = 0;
-    }
-    if (scanning && source_index == distance_lists.size()) {
-        scanning = false;
-        last_sweep = now;
-        auto& live = state.crowd;
-        live.processed = sweep_status.processed;
-        live.facial = sweep_status.facial;
-        live.joint = sweep_status.joint;
-        live.upper = sweep_status.upper;
-        live.partial = sweep_status.partial;
-        live.frozen = sweep_status.frozen;
-        live.bound_lods = sweep_status.bound_lods;
-        live.list_sources = sweep_status.list_sources;
-    }
-    for (; !entities.empty() && work++ < 16 && std::chrono::steady_clock::now() < deadline;) {
-        restore_cursor %= entities.size();
-        auto& entry = entities[restore_cursor];
-        const bool expired = !enable || (!s.lod && !s.chain) || (last_sweep > 0 && now - last_sweep > 60) ||
-                             (!scanning && entry.seen != sweep);
-        for (unsigned i = 0; i < entry.parts.size(); ++i)
-            if (expired || (i == 3 ? !s.chain : !s.lod)) update_part(entry.parts[i], {}, now);
-        if (expired && std::none_of(entry.parts.begin(), entry.parts.end(), [](const auto& p) { return p.change.written.has_value(); })) {
-            if (restore_cursor + 1 < entities.size()) entry = std::move(entities.back());
-            entities.pop_back();
-        } else ++restore_cursor;
-    }
-    if (!enable || (!s.lod && !s.chain)) {
-        state.crowd.processed = state.crowd.facial = state.crowd.joint = state.crowd.upper = 0;
-        state.crowd.partial = state.crowd.frozen = 0;
-    }
-}
-
-void update_crowd(const CrowdSettings& s, bool enable, double now) {
-    if (!enable && !caps.owned && !caps.initialized && entities.empty()) {
-        if (crowd_running) { crowd = {}; crowd_frames = 0; crowd_running = false; }
-        state.crowd.paused = state.crowd.restoring = state.crowd.owned = false;
-        return;
-    }
-    bind_crowd(now, enable && (s.npc || s.pawn));
-    const auto paused = enable ? read_method(gui_pause, API::get()->get_managed_singleton("app.GuiManager"), Scalar::boolean) :
-        std::optional<double>{0.0};
-    if (crowd_running != enable) {
-        crowd = {};
-        if (enable && caps.initialized) crowd.set_limits(s, caps.baseline[2]);
-        crowd_frames = 0;
-        next_caps = 0;
-        last_crowd_frame = 0;
-        crowd_running = enable;
-    }
-    state.crowd.paused = paused != 0.0;
-    state.crowd.pause_available = paused.has_value();
-    if (state.crowd.paused) {
-        last_crowd_frame = 0;
-        crowd.headroom_seconds = 0;
-        return;
-    }
-    const bool caps_enabled = enable && (s.npc || s.pawn);
-    const double dt = last_crowd_frame > 0 ? now - last_crowd_frame : 0;
-    last_crowd_frame = now;
-    if (enable) {
-        const auto adjustments = crowd.adjustments;
-        crowd.observe(dt, s);
-        if (crowd.adjustments != adjustments) next_caps = 0;
-        if (crowd.count >= 20) ++crowd_frames;
-    }
-    update_caps(s, caps_enabled, now);
-    update_entities(s, enable && crowd.count >= 20, now);
-    auto& live = state.crowd;
-    live.fps = crowd.fps;
-    live.average = crowd.average;
-    live.minimum = crowd.minimum;
-    live.maximum = crowd.maximum;
-    live.adjustments = crowd.adjustments;
-    live.mode = crowd.mode;
-    live.owned = caps.owned || !entities.empty();
-    live.restoring = !enable && live.owned;
 }
 } // namespace
 
-bool position(Object* transform, V3& value) { return vector_position(transform, value); }
+Object* gameplay_player(const API::TDB* db) {
+    auto& api = API::get();
+    if (!db || !api->get_vm_context()) return nullptr;
+    if (gameplay_binding.db != db) {
+        gameplay_binding = {db};
+        gameplay_binding.character = db->find_type("app.Character");
+        gameplay_binding.game_object_type = db->find_type("via.GameObject");
+        if (auto* gui = inherited_method(db->find_type("app.GuiManager"), {"get_IsLoadGui"});
+            gui && scalar(gui->get_return_type()) == Scalar::boolean) gameplay_binding.load_gui = gui;
+        if (auto* type = db->find_type("app.CharacterManager")) {
+            auto* getter = inherited_method(type, {"get_ManualPlayer"});
+            if (getter && derives_from(getter->get_return_type(), gameplay_binding.character))
+                gameplay_binding.getter = getter;
+            for (const auto* name : {"<ManualPlayer>k__BackingField", "_ManualPlayer"}) {
+                auto* field = type->find_field(name);
+                if (field && !field->is_static() && derives_from(field->get_type(), gameplay_binding.character)) {
+                    gameplay_binding.field = field;
+                    break;
+                }
+            }
+        }
+    }
+    if (gameplay_binding.load_gui &&
+        read_method(gameplay_binding.load_gui, api->get_managed_singleton("app.GuiManager"), Scalar::boolean) == 1.0)
+        return nullptr;
 
-void update(const EngineSettings& settings, const Camera& camera, bool motion, bool combat, bool blocked, double now) {
+    auto* manager = api->get_managed_singleton("app.CharacterManager");
+    if (!manager) return nullptr;
+    // Skip the title-screen getter when the backing slot is empty. Confirm a
+    // populated slot with the getter when available, since it can outlive play.
+    const auto* backing = gameplay_binding.field ? gameplay_binding.field->get_data_raw(manager, false) : nullptr;
+    auto* player = backing ? unpack<Object*>(backing) : nullptr;
+    if (gameplay_binding.field && !player) return nullptr;
+    if (gameplay_binding.getter) player = object_call(gameplay_binding.getter, manager);
+    auto* type = managed_type(player);
+    if (!derives_from(type, gameplay_binding.character)) return nullptr;
+    auto& binding = gameplay_binding;
+    if (binding.player_type != type) {
+        binding.player_type = type;
+        binding.game_object = inherited_method(type, {"get_GameObject"});
+        binding.valid = inherited_method(type, {"get_Valid"});
+        if (binding.valid && scalar(binding.valid->get_return_type()) != Scalar::boolean) binding.valid = nullptr;
+    }
+    if (binding.valid && read_method(binding.valid, player, Scalar::boolean) != 1.0) return nullptr;
+    auto* object = object_call(binding.game_object, player);
+    return derives_from(managed_type(object), binding.game_object_type) ? player : nullptr;
+}
+
+std::optional<CombatReading> read_combat(const API::TDB* db, Object* player) {
+    if (!db || !player) return {};
+    if (combat_binding.db != db) {
+        combat_binding = {db};
+        if (auto* type = db->find_type("app.BattleManager")) {
+            for (const auto& [name, source] : {
+                    std::pair{"get_IsBattleMode", "app.BattleManager.get_IsBattleMode"},
+                    {"get_IsInBattle", "app.BattleManager.get_IsInBattle"},
+                    {"get_isInBattle", "app.BattleManager.get_isInBattle"},
+                    {"get_IsBattle", "app.BattleManager.get_IsBattle"}}) {
+                if (auto* getter = inherited_method(type, {name}); getter &&
+                    scalar(getter->get_return_type()) == Scalar::boolean) {
+                    combat_binding.getter = getter;
+                    combat_binding.source = source;
+                    break;
+                }
+            }
+        }
+    }
+    if (!combat_binding.getter) return {};
+    auto* manager = API::get()->get_managed_singleton("app.BattleManager");
+    const auto value = read_method(combat_binding.getter, manager, Scalar::boolean);
+    return value ? std::optional<CombatReading>{{*value != 0.0, combat_binding.source}} : std::nullopt;
+}
+
+void suspend_world() {
+    loading_player = 0;
+    last_crowd_frame = 0;
+    loading_tdb = nullptr;
+    world_ready_at = last_world_update = 0;
+    state.world = WorldReadiness::waiting;
+}
+
+void update(const EngineSettings& settings, Object* player, Object* camera_object, Object* (*find_camera_object)(),
+            bool motion, bool combat, bool blocked, double now) {
     const auto* current_tdb = API::get()->tdb();
-    if (!current_tdb || !API::get()->get_vm_context()) return;
+    const bool have_vm = current_tdb && API::get()->get_vm_context();
+    if (!player || !have_vm) {
+        suspend_world();
+    } else {
+        // A save load can interrupt UpdateBehavior. Restart the grace period
+        // after a gap or when the player or VM changes.
+        const auto player_key = object_key(player);
+        if (loading_player != player_key || loading_tdb != current_tdb ||
+            now - last_world_update >= world_grace_seconds) {
+            suspend_world();
+            loading_player = player_key;
+            loading_tdb = current_tdb;
+            world_ready_at = now + world_grace_seconds;
+        }
+        last_world_update = now;
+        state.world = now >= world_ready_at ? WorldReadiness::ready : WorldReadiness::settling;
+    }
+    const bool ready = state.world == WorldReadiness::ready;
+    const bool restoring = !settings.enabled && state.active_tweaks != 0;
+    if (!have_vm) {
+        if (restoring) {
+            for (size_t i = 0; i < changes.size(); ++i)
+                if (specs[i].owner == Owner::component) changes[i] = {};
+            report_tweaks();
+        }
+        return;
+    }
+    const auto& population = settings.crowd;
+    const bool crowd_enabled = population.enabled && (population.npc || population.pawn) && !blocked && !state.editing;
+    const bool restoring_caps = !crowd_enabled && caps.owned;
+    if (!ready && !restoring && !restoring_caps) return;
     if (current_tdb != tdb) {
         if (tdb) {
             changes = {};
-            for (auto& entry : throttled) if (entry.actor) guarded([&] { release(entry); return true; });
-            entities.clear();
             caps = {};
+            state.crowd.owned = state.crowd.restoring = false;
         }
         invalidate();
         tdb = current_tdb;
     }
-    if (settings.enabled && !blocked && settings.trigger_night) poll_clock(settings, now);
-    const bool active = settings.enabled && !blocked && !state.editing &&
+    if (ready && settings.enabled && !blocked && settings.trigger_night) poll_clock(settings, now);
+    const bool active = ready && settings.enabled && !blocked && !state.editing &&
         (settings.always || settings.force_night || (settings.trigger_motion && motion) || (settings.trigger_combat && combat) ||
          (settings.trigger_night && state.night));
-    if (now >= next_update || active != previous_active) {
+    if (restoring || (ready && (now >= next_update || active != previous_active))) {
         previous_active = active;
         next_update = now + 1.0;
+        bool camera_resolved = camera_object != nullptr;
         for (size_t i = 0; i < bindings.size(); ++i) {
             auto& change = changes[i];
-            const bool on = active && settings.tweaks[i] && (i < shadow_quality || settings.heavy) &&
-                            (i != effects || !settings.effects_combat_only || combat);
-            if (!on && !change.written && (blocked || !snapshot_to_restore[i])) continue;
+            const bool configured = ready && settings.enabled && !blocked && settings.tweak_enabled(i) &&
+                                    (!heavy_tweak(i) || settings.heavy);
+            const bool on = active && configured;
+            if (!configured && !change.written && (!ready || blocked || !snapshot_to_restore[i])) continue;
+            const bool camera_tweak = specs[i].owner == Owner::component;
+            if (!on && change.written && now < change.retry && (ready || !camera_tweak)) continue;
+            bool found_camera_owner = false;
             guarded([&] {
-                bind(i, camera.game_object, now);
+                if (camera_tweak) {
+                    if (!camera_resolved) {
+                        camera_resolved = true;
+                        if (find_camera_object) camera_object = find_camera_object();
+                    }
+                    if (!camera_object) return false;
+                }
+                bind(i, camera_object, now);
                 if (!bindings[i]) return false;
                 const auto& access = bindings[i];
-                auto* obj = owner(owners[i], types[i], camera.game_object);
+                auto* obj = owner(specs[i], camera_object);
+                found_camera_owner = camera_tweak && obj;
                 const auto value = obj ? read(access, obj) : std::nullopt;
+                if (!value && !change.written) {
+                    bindings[i] = {};
+                    properties[i] = nullptr;
+                    return false;
+                }
                 change.reconcile(obj, access, value, on, now);
                 if (on && value && change.owner) captured[i] = change.baseline;
                 if (value && (on || change.written))
-                    change.apply(access, *value, on ? target(i, settings, change.baseline) : change.baseline, on, now);
-                if (obj && value && !blocked && !change.written && snapshot_to_restore[i]) {
+                    change.apply(access, obj, *value, on ? target(i, settings, change.baseline) : change.baseline, on, now);
+                if (ready && obj && value && !blocked && !change.written && snapshot_to_restore[i]) {
                     const auto expected = *snapshot_to_restore[i];
                     const auto latest = read(access, obj);
                     const auto after = latest && same(*latest, expected) ? latest :
@@ -1024,21 +893,13 @@ void update(const EngineSettings& settings, const Camera& camera, bool motion, b
                 }
                 return true;
             });
+            // Camera components may have been destroyed during a world
+            // transition. Never hold a stale restore against them.
+            if (restoring && !ready && camera_tweak && !found_camera_owner) change = {};
         }
     }
-    update_npcs(settings, camera, settings.npc && !blocked && !state.editing, now);
-    update_crowd(settings.crowd, settings.crowd.enabled && !blocked && !state.editing, now);
-    state.active_tweaks = int(std::count_if(changes.begin(), changes.end(), [](const auto& x) { return x.written.has_value(); }));
-    state.camera_tweaks_active = changes[ssao_half].written.has_value() || changes[ssr_half].written.has_value();
-    state.throttled_npcs = int(std::count_if(throttled.begin(), throttled.end(), [](const auto& x) { return x.actor != nullptr; }));
-    state.pending_snapshot = int(std::count_if(snapshot_to_restore.begin(), snapshot_to_restore.end(),
-        [](const auto& x) { return x.has_value(); }));
-    state.properties = properties;
-    for (size_t i = 0; i < changes.size(); ++i) {
-        const auto& change = changes[i];
-        state.tweak_status[i] = change.failures ? "Write/readback failed" : change.written ? "Applied" :
-            bindings[i] ? "Ready" : "Binding unavailable";
-    }
+    if (ready || restoring_caps) update_crowd(population, ready && crowd_enabled, now);
+    report_tweaks();
 }
 
 void edit(bool enabled) {
@@ -1053,34 +914,23 @@ void refresh() {
     next_update = next_clock = 0;
     next_caps = next_crowd_bind = 0;
     discovery_retry = {};
+    native_binding_status = {};
     if (!state.crowd.rule_hook) rule_hook_checked = false;
-    for (auto& entity : entities) for (auto& part : entity.parts) {
-        if (!part.target.ptr) part.looked_up = false;
-        part.change.retry = 0;
-        part.change.failures = 0;
-    }
     for (auto& change : changes) { change.retry = 0; change.failures = 0; }
+}
+void reseed_crowd_limits() {
+    caps.initialized = false;
+    next_caps = 0;
 }
 void invalidate() {
     bindings = {};
     properties = {};
     render_config_get = clock_hour = clock_minute = nullptr;
-    npcs = {};
-    position_bindings = {};
-    actor_bindings = {};
-    list_binding = {};
-    motion_type = nullptr;
-    motion_rate = {};
     shadow_sizes.clear();
     gui_pause = nullptr;
     rule_hook_checked = false;
     caps.ready = false;
-    distance_lists = {};
-    distance_list_types = {};
-    entity_bindings = {};
-    part_bindings = {};
-    scanning = false;
-    state.clock_valid = state.night = state.npc_bindings = false;
+    state.clock_valid = state.night = false;
     refresh();
 }
 

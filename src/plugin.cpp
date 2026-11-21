@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace {
 using namespace dd2;
@@ -28,19 +29,13 @@ using Clock = std::chrono::steady_clock;
 const REFrameworkPluginInitializeParam* host{};
 std::filesystem::path config_path;
 std::mutex frame_mutex;
-Settings settings;
+Settings settings = recommended_steam_deck_settings();
 std::atomic<Activity> active_reason{Activity::idle};
-std::atomic<bool> g_in_combat{false};
-float camera_velocity{};
-bool camera_found{};
-CameraBlurEnvelope camera_blur{};
-GpuGate gpu_gate{};
-float gpu_time_ms{}, gpu_load_weight{};
-Clock::time_point last_gpu_sample{};
+std::atomic<bool> callbacks_ready{};
 std::atomic<bool> renderer_reset{};
-bool perf_lua_present{}, timing_callbacks{}, timing_valid{};
+bool perf_lua_present{};
 Extent previous_output{};
-unsigned blur_probe_frames{};
+void* previous_swapchain{};
 const char* save_status{};
 const char* snapshot_status{};
 bool confirm_snapshot_restore{};
@@ -50,33 +45,42 @@ const char* last_renderer_error{};
 struct CameraSample {
     API::ManagedObject* camera{};
     API::ManagedObject* game_object{};
-    API::ManagedObject* transform{};
     Quaternion rotation{};
 };
-CameraSample previous{};
+struct PreviousCameraSample {
+    uintptr_t key{};
+    Quaternion rotation{};
+} previous;
 Clock::time_point previous_time{};
 Clock::time_point next_diagnostics{};
 Clock::time_point next_combat_poll{};
 Motion motion{};
 Combat combat{};
+constexpr const char* waiting_combat = "Waiting for combat binding";
+const char* battle_source = waiting_combat;
 
-struct BattleBindings {
-    API::TypeDefinition* type{};
-    API::Method* is_battle{};
-    API::Field* is_battle_field{};
-    API::Method* battle_state{};
-    size_t state_bytes{};
-    bool resolved{};
-} battle;
+// Accessed under frame_mutex. No managed handles cross the callback boundary.
+struct GameplayFrame {
+    engine::Status optimizer{};
+    engine::Baselines baselines{};
+    const char* battle_source{waiting_combat};
+    float camera_speed{};
+    bool camera_found{}, motion_active{}, in_combat{};
+} published_gameplay;
 
-const char* battle_source{"Waiting for BattleManager"};
+struct GameplayRequests {
+    bool reset_world{}, reset_combat{}, refresh{}, reseed_crowd{}, cancel_snapshot{};
+    std::optional<bool> edit;
+    std::optional<engine::Baselines> restore_snapshot;
+} gameplay_requests;
 
 struct ObjectMethod {
     API::TypeDefinition* type{};
     API::Method* method{};
 
     API::Method* get(API::ManagedObject* object, const char* name) {
-        if (!object) return nullptr;
+        const auto* sdk = host->sdk->managed_object;
+        if (!object || (sdk->is_managed_object && !sdk->is_managed_object(object))) return nullptr;
         auto* current = object->get_type_definition();
         if (!current) return nullptr;
         if (current != type || !method) {
@@ -93,6 +97,7 @@ struct CameraBindings {
     API::TypeDefinition* quaternion{};
     API::Method* main_view{};
     API::Method* primary_camera{};
+    API::ManagedObject* view_instance{};
     ObjectMethod get_object, get_transform, get_rotation;
 } camera_bindings;
 
@@ -119,8 +124,7 @@ bool ui_ready{};
 
 constexpr std::array crowd_flags{
     std::pair{"cpu_opt_enabled", &CrowdSettings::enabled}, std::pair{"npc_enabled", &CrowdSettings::npc},
-    std::pair{"pawn_enabled", &CrowdSettings::pawn}, std::pair{"lod_enabled", &CrowdSettings::lod},
-    std::pair{"chain_enabled", &CrowdSettings::chain}
+    std::pair{"pawn_enabled", &CrowdSettings::pawn}
 };
 constexpr std::array crowd_numbers{
     std::pair{"fps_target", &CrowdSettings::fps_target}, std::pair{"fps_critical", &CrowdSettings::fps_critical},
@@ -129,15 +133,9 @@ constexpr std::array crowd_numbers{
     std::pair{"npc_step", &CrowdSettings::npc_step}, std::pair{"npc_emergency_step", &CrowdSettings::npc_emergency_step},
     std::pair{"manual_npc_limit", &CrowdSettings::manual_npc_limit},
     std::pair{"pawn_min", &CrowdSettings::pawn_min}, std::pair{"pawn_max", &CrowdSettings::pawn_max},
-    std::pair{"lod_interval", &CrowdSettings::lod_interval}, std::pair{"adjust_interval", &CrowdSettings::adjust_interval},
+    std::pair{"adjust_interval", &CrowdSettings::adjust_interval},
     std::pair{"sample_window", &CrowdSettings::sample_window}, std::pair{"hysteresis", &CrowdSettings::hysteresis}
 };
-constexpr std::array crowd_distances{
-    std::pair{"lod_facial_dist", &CrowdSettings::facial_distance}, std::pair{"lod_joint_dist", &CrowdSettings::joint_distance},
-    std::pair{"lod_upper_dist", &CrowdSettings::upper_distance}, std::pair{"chain_freeze_near", &CrowdSettings::freeze_near},
-    std::pair{"chain_freeze_far", &CrowdSettings::freeze_far}
-};
-
 bool config_flag(const Json& j, const char* key, bool fallback) {
     const auto it = j.find(key);
     return it != j.end() && it->is_boolean() ? it->get<bool>() : fallback;
@@ -152,20 +150,23 @@ float config_number(const Json& j, const char* key, float fallback) {
 
 void read_crowd_config(const Json& j, CrowdSettings& c) {
     for (const auto& [key, member] : crowd_flags) c.*member = config_flag(j, key, c.*member);
+    c.manual_npc_limit = 0; // Legacy configurations without a manual cap were adaptive.
     for (const auto& [key, member] : crowd_numbers)
         c.*member = int(std::round(std::clamp(config_number(j, key, float(c.*member)), 0.0f, 1200.0f)));
-    for (const auto& [key, member] : crowd_distances) {
-        const float m = c.*member;
-        c.*member = std::sqrt(std::max(0.0f, config_number(j, key, m * m)));
-    }
+    const float pawn_baseline = config_number(j, "pawn_baseline", -1.0f);
+    c.pawn_baseline = pawn_baseline >= 0.0f
+        ? std::optional{int(std::round(std::min(pawn_baseline, 30.0f)))} : std::nullopt;
     c.recovery_seconds = config_number(j, "crowd_recovery_seconds", c.recovery_seconds);
 }
 
 void read_engine_tweaks(const Json& j, EngineSettings& e) {
-    for (size_t i = 0; i < e.tweaks.size(); ++i) e.tweaks[i] = config_flag(j, engine_keys[i], e.tweaks[i]);
+    for (size_t i = 0; i < e.tweaks.size(); ++i)
+        e.tweaks[i] = config_flag(j, engine_keys[i], e.tweaks[i]);
+    // Older configurations stored the screen-only choice separately from
+    // their combined screen/water flag. Migrate the screen choice.
+    e.tweaks[ssr_disable] = config_flag(j, "disable_screen_space_reflections", e.tweaks[ssr_disable]);
     e.speedtree_bias = config_number(j, "speedtree_lod_bias", e.speedtree_bias);
     e.motion_target = config_number(j, "motion_quality_target", e.motion_target);
-    e.foliage_retention = config_number(j, "far_foliage_retention_pct", e.foliage_retention);
     e.shadow_target = config_number(j, "shadow_quality_target", e.shadow_target);
     e.shadow_pixels = config_number(j, "shadow_resolution_target", e.shadow_pixels);
     e.night_start = config_number(j, "night_start_hour", e.night_start);
@@ -187,9 +188,9 @@ void import_lua_settings(Settings& s) {
     e.trigger_motion = config_flag(j, "trigger_motion", e.trigger_motion);
     e.trigger_combat = config_flag(j, "trigger_combat", e.trigger_combat);
     e.trigger_night = config_flag(j, "trigger_night", e.trigger_night);
-    e.effects_combat_only = false;
     read_engine_tweaks(j, e);
-    e.heavy = std::any_of(e.tweaks.begin() + shadow_quality, e.tweaks.end(), [](bool enabled) { return enabled; });
+    e.heavy = std::any_of(e.tweaks.begin() + shadow_quality, e.tweaks.begin() + ssr_half + 1,
+        [](bool enabled) { return enabled; });
     s.motion_threshold = config_number(j, "motion_threshold", 1.8f);
     s.hold = config_number(j, "motion_hold_seconds", 1.2f);
     s.combat_exit_delay = config_number(j, "combat_hold_seconds", 2.5f);
@@ -197,7 +198,7 @@ void import_lua_settings(Settings& s) {
 }
 
 Settings read_config() {
-    Settings s;
+    Settings s = recommended_steam_deck_settings();
     try {
         import_lua_settings(s);
         sanitize(s);
@@ -216,36 +217,30 @@ Settings read_config() {
             const double value = it->get<double>();
             return value >= 0 && value <= last ? static_cast<int>(value) : fallback;
         };
-        s.activation_mode = mode("activation_mode", flag("force_always_on", false) ? always_on : adaptive, motion_only);
+        const int default_activation = j.contains("force_always_on")
+            ? (flag("force_always_on", false) ? always_on : adaptive) : s.activation_mode;
+        s.activation_mode = mode("activation_mode", default_activation, motion_only);
         s.profile_mode = mode("profile_mode", 0, int(profiles.size()) - 1);
+        s.optimizer_enabled = flag("optimizer_enabled", s.optimizer_enabled);
         s.enabled = flag("enabled", s.enabled);
         s.verbose_logging = flag("verbose_logging", s.verbose_logging);
         s.shade_transparent_passes = flag("shade_transparent_passes", s.shade_transparent_passes);
-        s.border_blur.enabled = flag("border_motion_blur", s.border_blur.enabled);
-        s.border_blur.multiplier = number("border_blur_multiplier", s.border_blur.multiplier);
-        s.border_blur.threshold = number("border_blur_camera_threshold", s.border_blur.threshold);
-        s.border_blur.fade_ms = number("border_blur_fade_ms", s.border_blur.fade_ms);
-        s.gpu_gate.enabled = flag("adaptive_gpu_load_trigger", s.gpu_gate.enabled);
-        s.gpu_gate.target_ms = number("target_gpu_frame_time_ms", s.gpu_gate.target_ms);
-        s.gpu_gate.band_ms = number("gpu_hysteresis_band_ms", s.gpu_gate.band_ms);
+        s.allow_native_vrs = flag("allow_native_resolution_vrs", s.allow_native_vrs);
         auto& e = s.engine;
         e.enabled = flag("native_engine_optimizer", e.enabled);
-        e.always = flag("engine_force_on", e.always);
         e.force_night = flag("engine_force_night", e.force_night);
+        e.always = flag("engine_force_on", e.always && !e.force_night);
         e.heavy = flag("heavy_render_target_tweaks", e.heavy);
-        e.npc = flag("behind_camera_npc_throttling", e.npc);
         e.trigger_motion = flag("engine_trigger_motion", e.trigger_motion);
         e.trigger_combat = flag("engine_trigger_combat", e.trigger_combat);
         e.trigger_night = flag("engine_trigger_night", e.trigger_night);
-        e.effects_combat_only = flag("effect_lod_combat_only", e.effects_combat_only);
         read_engine_tweaks(j, e);
         read_crowd_config(j, e.crowd);
-        e.npc_dot = number("npc_behind_dot", e.npc_dot);
-        e.npc_distance = number("npc_min_distance", e.npc_distance);
-        s.center.width = number("center_width_percent", s.center.width);
-        s.center.height = number("center_height_percent", s.center.height);
+        const bool legacy_center = j.contains("center_width_percent") || j.contains("center_height_percent");
+        s.center.profile_relative = !flag("center_size_uses_full_range", !legacy_center);
+        s.center.width = number("center_width_percent", s.center.profile_relative ? 100.0f : s.center.width);
+        s.center.height = number("center_height_percent", s.center.profile_relative ? 100.0f : s.center.height);
         s.center.locked = flag("lock_center_aspect_ratio", s.center.locked);
-        s.center.profile_relative = !flag("center_size_uses_full_range", false);
         s.reference.width = uint32_t(std::clamp(number("render_width", float(s.reference.width)), 320.0f, 7680.0f));
         s.reference.height = uint32_t(std::clamp(number("render_height", float(s.reference.height)), 200.0f, 4320.0f));
     } catch (...) {
@@ -258,16 +253,11 @@ Settings read_config() {
 bool save_config(const Settings& s) {
     if (config_path.empty()) return false;
     Json j{
+        {"optimizer_enabled", s.optimizer_enabled},
         {"enabled", s.enabled}, {"activation_mode", s.activation_mode}, {"profile_mode", s.profile_mode},
         {"verbose_logging", s.verbose_logging}, {"motion_threshold", s.motion_threshold},
         {"shade_transparent_passes", s.shade_transparent_passes},
-        {"border_motion_blur", s.border_blur.enabled},
-        {"border_blur_multiplier", s.border_blur.multiplier},
-        {"border_blur_camera_threshold", s.border_blur.threshold},
-        {"border_blur_fade_ms", s.border_blur.fade_ms},
-        {"adaptive_gpu_load_trigger", s.gpu_gate.enabled},
-        {"target_gpu_frame_time_ms", s.gpu_gate.target_ms},
-        {"gpu_hysteresis_band_ms", s.gpu_gate.band_ms},
+        {"allow_native_resolution_vrs", s.allow_native_vrs},
         {"center_width_percent", s.center.width}, {"center_height_percent", s.center.height},
         {"lock_center_aspect_ratio", s.center.locked},
         {"center_size_uses_full_range", !s.center.profile_relative},
@@ -276,19 +266,18 @@ bool save_config(const Settings& s) {
     };
     const auto& e = s.engine;
     j.update(Json{{"native_engine_optimizer", e.enabled}, {"engine_force_on", e.always}, {"engine_force_night", e.force_night},
-        {"heavy_render_target_tweaks", e.heavy}, {"behind_camera_npc_throttling", e.npc},
+        {"heavy_render_target_tweaks", e.heavy},
         {"engine_trigger_motion", e.trigger_motion}, {"engine_trigger_combat", e.trigger_combat},
-        {"engine_trigger_night", e.trigger_night}, {"effect_lod_combat_only", e.effects_combat_only},
+        {"engine_trigger_night", e.trigger_night},
         {"speedtree_lod_bias", e.speedtree_bias},
-        {"motion_quality_target", e.motion_target}, {"far_foliage_retention_pct", e.foliage_retention},
+        {"motion_quality_target", e.motion_target},
         {"shadow_quality_target", e.shadow_target}, {"shadow_resolution_target", e.shadow_pixels},
-        {"night_start_hour", e.night_start}, {"night_end_hour", e.night_end},
-        {"npc_behind_dot", e.npc_dot}, {"npc_min_distance", e.npc_distance}});
+        {"night_start_hour", e.night_start}, {"night_end_hour", e.night_end}});
     for (size_t i = 0; i < e.tweaks.size(); ++i) j[engine_keys[i]] = e.tweaks[i];
     const auto& c = e.crowd;
     for (const auto& [key, member] : crowd_flags) j[key] = c.*member;
     for (const auto& [key, member] : crowd_numbers) j[key] = c.*member;
-    for (const auto& [key, member] : crowd_distances) j[key] = (c.*member) * (c.*member);
+    if (c.pawn_baseline) j["pawn_baseline"] = *c.pawn_baseline;
     j["crowd_recovery_seconds"] = c.recovery_seconds;
     std::filesystem::create_directories(config_path.parent_path());
     auto temp = config_path;
@@ -306,12 +295,10 @@ bool save_config(const Settings& s) {
 
 bool save_baseline(const engine::Baselines& values) {
     if (config_path.empty()) return false;
-    constexpr const char* ids[]{"speedtree", "motion_quality", "contact_shadows", "far_foliage", "effect_lod",
-        "shadow_quality", "shadow_resolution", "ssao_half", "ssr_half"};
     Json snapshot = Json::object();
     for (size_t i = 0; i < values.size(); ++i) if (values[i]) {
-        if (i >= ssao_half) snapshot[ids[i]] = {{"kind", "boolean"}, {"value", *values[i] != 0}};
-        else snapshot[ids[i]] = {{"kind", "number"}, {"value", *values[i]}};
+        if (boolean_tweak(i)) snapshot[baseline_keys[i]] = {{"kind", "boolean"}, {"value", *values[i] != 0}};
+        else snapshot[baseline_keys[i]] = {{"kind", "number"}, {"value", *values[i]}};
     }
     if (snapshot.empty()) return false;
     const auto path = config_path.parent_path() / "AdaptivePerformanceOptimizer_baseline.json";
@@ -331,15 +318,13 @@ std::optional<engine::Baselines> load_baseline() {
     const auto snapshot = Json::parse(file);
     if (!snapshot.is_object() || snapshot.value("format", 0) != 1 ||
         !snapshot.contains("values") || !snapshot["values"].is_object()) return {};
-    constexpr const char* ids[]{"speedtree", "motion_quality", "contact_shadows", "far_foliage", "effect_lod",
-        "shadow_quality", "shadow_resolution", "ssao_half", "ssr_half"};
     engine::Baselines values{};
     for (size_t i = 0; i < values.size(); ++i) {
-        const auto it = snapshot["values"].find(ids[i]);
+        const auto it = snapshot["values"].find(baseline_keys[i]);
         if (it == snapshot["values"].end() || !it->is_object() || !it->contains("value")) continue;
         const auto& value = (*it)["value"];
-        if (i >= ssao_half && value.is_boolean()) values[i] = value.get<bool>();
-        if (i < ssao_half && value.is_number()) {
+        if (boolean_tweak(i) && value.is_boolean()) values[i] = value.get<bool>();
+        if (!boolean_tweak(i) && value.is_number()) {
             const auto v = value.get<double>();
             if (std::isfinite(v)) values[i] = v;
         }
@@ -354,119 +339,40 @@ bool invoke(API::Method* method, void* instance, reframework::InvokeRet& out) {
         REFRAMEWORK_ERROR_NONE && !out.exception_thrown;
 }
 
-void resolve_battle(const API::TDB* tdb) {
-    battle.resolved = true;
-    battle.type = tdb->find_type("app.BattleManager");
-    auto* boolean = tdb->find_type("System.Boolean");
-    if (!battle.type) return;
-    const auto getter = [](const char* name) -> API::Method* {
-        auto* method = battle.type->find_method(name);
-        return method && !method->is_static() && method->get_num_params() == 0 ? method : nullptr;
-    };
-    guarded([&] {
-        auto* method = getter("get_IsBattle");
-        if (method && boolean && method->get_return_type() == boolean) battle.is_battle = method;
-        return true;
-    });
-    if (host->sdk->field) guarded([&] {
-        auto* field = battle.type->find_field("_IsBattle");
-        if (field && boolean && !field->is_static() && field->get_type() == boolean)
-            battle.is_battle_field = field;
-        return true;
-    });
-    guarded([&] {
-        auto* method = getter("get_BattleState");
-        auto* type = method ? method->get_return_type() : nullptr;
-        if (!type) return false;
-        if (!type->is_enum()) {
-            const auto name = type->get_full_name();
-            if (name != "System.Byte" && name != "System.SByte" && name != "System.Int16" &&
-                name != "System.UInt16" && name != "System.Int32" && name != "System.UInt32" &&
-                name != "System.Int64" && name != "System.UInt64") return false;
-        }
-        const auto size = type->get_valuetype_size();
-        if (size != 1 && size != 2 && size != 4 && size != 8) return false;
-        battle.battle_state = method;
-        battle.state_bytes = size;
-        return true;
-    });
-}
-
-std::optional<bool> read_battle() {
-    auto& api = API::get();
-    if (!api->get_vm_context()) return {};
-    if (!battle.is_battle && !battle.is_battle_field && !battle.battle_state) return {};
-    auto* manager = api->get_managed_singleton("app.BattleManager");
-    if (!manager || manager->get_type_definition() != battle.type) return {};
-
-    bool active{};
-    if (battle.is_battle && guarded([&] {
-        reframework::InvokeRet out{};
-        if (!invoke(battle.is_battle, manager, out)) return false;
-        active = out.bytes[0] != 0;
-        return true;
-    })) {
-        battle_source = "get_IsBattle";
-        return active;
-    }
-    if (battle.is_battle_field && guarded([&] {
-        const auto* value = static_cast<const uint8_t*>(battle.is_battle_field->get_data_raw(manager));
-        if (!value) return false;
-        active = *value != 0;
-        return true;
-    })) {
-        battle_source = "_IsBattle";
-        return active;
-    }
-    if (battle.battle_state && guarded([&] {
-        reframework::InvokeRet out{};
-        if (!invoke(battle.battle_state, manager, out)) return false;
-        active = std::any_of(out.bytes.begin(), out.bytes.begin() + battle.state_bytes,
-                             [](auto byte) { return byte != 0; });
-        return true;
-    })) {
-        battle_source = "get_BattleState";
-        return active;
-    }
-    return {};
-}
-
 void reset_combat() {
     combat = {};
     next_combat_poll = {};
-    g_in_combat.store(false, std::memory_order_relaxed);
-    battle_source = "Waiting for BattleManager";
+    battle_source = waiting_combat;
 }
 
-void update_combat(Clock::time_point now, const Settings& current) {
+bool update_combat(Clock::time_point now, const Settings& current, engine::Object* player) {
     using namespace std::chrono_literals;
+    if (!player) {
+        if (next_combat_poll != Clock::time_point{}) reset_combat();
+        return false;
+    }
     const auto& e = current.engine;
     const bool engine_combat = e.enabled && !perf_lua_present &&
-        ((e.tweaks[effects] && e.effects_combat_only) || (!e.always && !e.force_night && e.trigger_combat));
-    if ((!current.enabled || current.activation_mode != adaptive || current.gpu_gate.enabled) && !engine_combat) return;
+        !e.always && !e.force_night && e.trigger_combat;
+    if ((!current.enabled || current.activation_mode != adaptive) && !engine_combat && !current.verbose_logging)
+        return false;
     const double seconds = std::chrono::duration<double>(now.time_since_epoch()).count();
     if (now >= next_combat_poll) {
         next_combat_poll = now + 1s;
-        std::optional<bool> sample;
-        guarded([&] {
-            // Initialization normally resolves the TDB. If the host had no TDB
-            // at load time, resolve it once as soon as it becomes available.
-            if (!battle.resolved) if (const auto* tdb = API::get()->tdb()) resolve_battle(tdb);
-            sample = read_battle();
-            return true;
-        });
-        if (!sample) battle_source = "BattleManager unavailable";
-        combat.observe(sample.value_or(false), seconds, current.combat_exit_delay);
+        std::optional<engine::CombatReading> sample;
+        guarded([&] { sample = engine::read_combat(API::get()->tdb(), player); return true; });
+        const char* source = sample ? sample->source : "Combat binding unavailable";
+        if (std::string_view{battle_source} != source) {
+            battle_source = source;
+            API::get()->log_info("[DD2 VRS] Combat source %s", source);
+        }
+        combat.observe(sample && sample->active, seconds, current.combat_exit_delay);
     }
-    g_in_combat.store(combat.active(seconds), std::memory_order_relaxed);
+    return combat.active(seconds);
 }
 
 int select_preset(const Settings& current) {
-    auto reason = activity(current, motion.active, g_in_combat.load(std::memory_order_relaxed));
-    if (current.gpu_gate.enabled && current.activation_mode != always_on && current.enabled &&
-        !full_sharp_center(current.center)) {
-        reason = gpu_load_weight > 0.001f ? Activity::gpu_load : Activity::idle;
-    }
+    const auto reason = activity(current, published_gameplay.motion_active, published_gameplay.in_combat);
     active_reason.store(reason, std::memory_order_relaxed);
     return reason == Activity::idle ? 0 : current.profile_mode + 1;
 }
@@ -476,8 +382,15 @@ const char* reason_label(Activity reason) {
     case Activity::combat: return "Combat";
     case Activity::motion: return "Motion";
     case Activity::forced: return "Forced";
-    case Activity::gpu_load: return "GPU load";
     default: return "Idle";
+    }
+}
+
+const char* world_label(engine::WorldReadiness readiness) {
+    switch (readiness) {
+    case engine::WorldReadiness::settling: return "Waiting for the player to settle (2 seconds)";
+    case engine::WorldReadiness::ready: return "Ready";
+    default: return "Waiting for player";
     }
 }
 
@@ -486,7 +399,7 @@ API::ManagedObject* object_result(API::Method* method, void* instance) {
     return invoke(method, instance, out) ? static_cast<API::ManagedObject*>(out.ptr) : nullptr;
 }
 
-bool read_camera(CameraSample& sample, bool need_rotation) {
+bool resolve_camera(CameraSample& sample) {
     auto& api = API::get();
     const auto* tdb = api->tdb();
     if (!tdb || !api->get_vm_context()) return false;
@@ -499,17 +412,34 @@ bool read_camera(CameraSample& sample, bool need_rotation) {
         auto* main_view = manager->find_method("get_MainView");
         auto* primary = view->find_method("get_PrimaryCamera");
         if (!main_view || !primary) return false;
-        binding = {tdb, manager, quaternion, main_view, primary, {}, {}, {}};
+        binding = {tdb, manager, quaternion, main_view, primary, nullptr, {}, {}, {}};
     }
 
     // Mirrors REFramework's Lua sdk.get_primary_camera implementation.
-    auto* view = object_result(binding.main_view, binding.manager->get_instance());
-    auto* camera = object_result(binding.primary_camera, view);
-    if (!camera) return false;
+    const auto* sdk = host->sdk->managed_object;
+    if (!binding.view_instance || (sdk->is_managed_object && !sdk->is_managed_object(binding.view_instance)))
+        binding.view_instance = object_result(binding.main_view, binding.manager->get_instance());
+    auto* camera = object_result(binding.primary_camera, binding.view_instance);
+    if (!camera) {
+        binding.view_instance = nullptr;
+        return false;
+    }
     auto* object = object_result(binding.get_object.get(camera, "get_GameObject"), camera);
+    if (!object || (sdk->is_managed_object && !sdk->is_managed_object(object))) return false;
     sample.camera = camera;
     sample.game_object = object;
-    if (!need_rotation) return object != nullptr;
+    return true;
+}
+
+engine::Object* camera_render_owner() {
+    CameraSample sample;
+    return resolve_camera(sample) ? sample.game_object : nullptr;
+}
+
+bool read_camera(CameraSample& sample) {
+    if (!resolve_camera(sample)) return false;
+    auto& binding = camera_bindings;
+    auto* object = sample.game_object;
     auto* transform = object_result(binding.get_transform.get(object, "get_Transform"), object);
     auto* rotation = binding.get_rotation.get(transform, "get_Rotation");
     if (!rotation || rotation->get_return_type() != binding.quaternion) return false;
@@ -517,7 +447,6 @@ bool read_camera(CameraSample& sample, bool need_rotation) {
     reframework::InvokeRet out{};
     if (!invoke(rotation, transform, out)) return false;
     std::memcpy(sample.rotation.data(), out.bytes.data(), sizeof(sample.rotation));
-    sample.transform = transform;
     return normalize(sample.rotation);
 }
 
@@ -537,40 +466,40 @@ void log_diagnostics(const Settings& settings_snapshot) {
     if (snapshot.tier < 2 || !snapshot.tile) return;
     const auto report = graphics::take_diagnostics();
     const auto n = [&](Diagnostic key) { return static_cast<unsigned long long>(report[key]); };
-    auto& api = API::get();
-    api->log_info("[DD2 VRS] Diagnostics | %s | output=%ux%u scene=%ux%u image=%ux%u tiles=%ux%u"
-        " enabled=%u activation_mode=%d profile=%s preset=%d reason=%s camera=%s battle_source=%s shade_transparent=%u",
+    const auto* log = host->functions;
+    log->log_info("[DD2 VRS] Diagnostics | %s | output=%ux%u scene=%ux%u image=%ux%u tiles=%ux%u"
+        " enabled=%u activation_mode=%d profile=%s preset=%d reason=%s camera=%s battle_source=%s in_combat=%u shade_transparent=%u allow_native_vrs=%u",
         snapshot.message, snapshot.output.width, snapshot.output.height,
         snapshot.scene.width, snapshot.scene.height, snapshot.image.width, snapshot.image.height,
         (snapshot.image.width + snapshot.tile - 1) / snapshot.tile,
         (snapshot.image.height + snapshot.tile - 1) / snapshot.tile, unsigned(settings_snapshot.enabled),
         settings_snapshot.activation_mode, profiles[settings_snapshot.profile_mode].name, snapshot.preset,
-        reason_label(active_reason.load()), camera_found ? "available" : "missing", battle_source,
-        unsigned(settings_snapshot.shade_transparent_passes));
-    api->log_info("[DD2 VRS] Targets | created_rtv=%llu created_dsv=%llu OM=%llu accepted=%llu mrt_accepted=%llu"
-        " image_bound_at_om=%llu transparent_image_bound=%llu output_excluded=%llu"
+        reason_label(active_reason.load()), published_gameplay.camera_found ? "available" : "missing", published_gameplay.battle_source,
+        unsigned(published_gameplay.in_combat), unsigned(settings_snapshot.shade_transparent_passes), unsigned(settings_snapshot.allow_native_vrs));
+    log->log_info("[DD2 VRS] Targets | created_rtv=%llu created_dsv=%llu OM=%llu accepted=%llu mrt_accepted=%llu"
+        " image_bound_at_om=%llu transparent_image_bound=%llu output_excluded=%llu viewport_fallback_candidates=%llu"
         " untracked_list=%llu color_count_outside_1_to_8=%llu no_depth=%llu"
         " missing_rtv=%llu missing_dsv=%llu view_layout=%llu depth_format=%llu extent_mismatch=%llu outside_scene_bounds=%llu",
         n(Diagnostic::rtv_created), n(Diagnostic::dsv_created), n(Diagnostic::om_calls),
         n(Diagnostic::om_accepted), n(Diagnostic::om_mrt_accepted), n(Diagnostic::om_image_bound),
-        n(Diagnostic::om_transparent_image_bound), n(Diagnostic::om_output_excluded),
+        n(Diagnostic::om_transparent_image_bound), n(Diagnostic::om_output_excluded), n(Diagnostic::om_viewport_fallback),
         n(Diagnostic::om_untracked_list), n(Diagnostic::om_color_count),
         n(Diagnostic::om_no_depth), n(Diagnostic::om_missing_rtv), n(Diagnostic::om_missing_dsv),
         n(Diagnostic::om_view_layout), n(Diagnostic::om_depth_format),
         n(Diagnostic::om_extent_mismatch), n(Diagnostic::om_extent_outside_reference));
-    api->log_info("[DD2 VRS] Indexed | calls=%llu eligible=%llu shaded=%llu"
+    log->log_info("[DD2 VRS] Indexed | calls=%llu eligible=%llu shaded=%llu"
         " untracked_list=%llu render_pass=%llu targets=%llu other_scene_extent=%llu"
         " preset_off=%llu image_unready_or_wrong_extent=%llu",
         n(Diagnostic::indexed_calls), n(Diagnostic::eligible), n(Diagnostic::shaded), n(Diagnostic::draw_untracked_list),
         n(Diagnostic::draw_render_pass), n(Diagnostic::draw_targets), n(Diagnostic::draw_other_scene_extent),
         n(Diagnostic::draw_preset_off), n(Diagnostic::draw_image_unready));
-    api->log_info("[DD2 VRS] Pass VRS | nonindexed=%llu nonindexed_with_image=%llu execute_indirect=%llu"
+    log->log_info("[DD2 VRS] Pass VRS | nonindexed=%llu nonindexed_with_image=%llu execute_indirect=%llu"
         " indirect_with_image=%llu engine_rate_max=%llu engine_image_deferred=%llu"
         " render_pass_begins=%llu execute_bundle=%llu tagged_psos=%llu",
         n(Diagnostic::nonindexed_calls), n(Diagnostic::nonindexed_image_bound), n(Diagnostic::indirect_calls),
         n(Diagnostic::indirect_image_bound), n(Diagnostic::rate_combiner_preserved), n(Diagnostic::engine_image_deferred),
         n(Diagnostic::render_pass_begins), n(Diagnostic::bundle_calls), n(Diagnostic::pso_created));
-    api->log_info("[DD2 VRS] Safety | max_rate=2x2 pipeline_policy=compute_only dispatch=%llu unbind_om=%llu unbind_pso=%llu"
+    log->log_info("[DD2 VRS] Safety | max_rate=2x2 pipeline_policy=compute_only dispatch=%llu unbind_om=%llu unbind_pso=%llu"
         " unbind_dispatch=%llu unbind_indirect=%llu indirect_signature_skipped=%llu"
         " indexed_compute_pso_blocked=%llu",
         n(Diagnostic::dispatch_calls), n(Diagnostic::unbind_om), n(Diagnostic::unbind_pso),
@@ -583,7 +512,7 @@ void log_diagnostics(const Settings& settings_snapshot) {
     for (size_t i = 0; i < report.bindings.size(); ++i) {
         const auto& sample = report.bindings[i];
         if (sample.reason == Diagnostic::count) continue;
-        api->log_info("[DD2 VRS] Target sample | %s RTV=%s %ux%u DXGI=%u DSV=%s %ux%u DXGI=%u",
+        log->log_info("[DD2 VRS] Target sample | %s RTV=%s %ux%u DXGI=%u DSV=%s %ux%u DXGI=%u",
             names[i], sample.color_tracked ? "tracked" : "untracked", sample.color.width, sample.color.height,
             unsigned(sample.color_format), sample.depth_tracked ? "tracked" : "untracked", sample.depth.width,
             sample.depth.height, unsigned(sample.depth_format));
@@ -591,15 +520,16 @@ void log_diagnostics(const Settings& settings_snapshot) {
     graphics::write_audit(graphics::take_audit(), host->functions->log_info,
                           settings_snapshot.activation_mode == always_on);
     if (settings_snapshot.engine.crowd.enabled && !perf_lua_present) {
-        const auto c = engine::status().crowd;
-        api->log_info("[DD2 VRS] Crowd | fps=%.1f avg=%.1f caps_ready=%u cap_write_failed=%u rule_hook=%u paused=%u pause_binding=%u npc=%d vanilla_npc=%d pawn=%d vanilla_pawn=%d changes=%d lists=0x%x lod_bindings=0x%x entities=%d facial=%d joints=%d upper=%d chain_partial=%d chain_full=%d",
+        const auto& optimizer = published_gameplay.optimizer;
+        const auto& c = optimizer.crowd;
+        log->log_info("[DD2 VRS] Crowd | world=%s fps=%.1f avg=%.1f caps_ready=%u cap_write_failed=%u rule_hook=%u paused=%u pause_binding=%u npc=%d vanilla_npc=%d pawn=%d vanilla_pawn=%d changes=%d",
+            world_label(optimizer.world),
             c.fps, c.average, unsigned(c.caps_ready), unsigned(c.cap_write_failed), unsigned(c.rule_hook), unsigned(c.paused),
-            unsigned(c.pause_available), c.npc, c.vanilla_npc, c.pawn, c.vanilla_pawn, c.adjustments, c.list_sources, c.bound_lods,
-            c.processed, c.facial, c.joint, c.upper, c.partial, c.frozen);
+            unsigned(c.pause_available), c.npc, c.vanilla_npc, c.pawn, c.vanilla_pawn, c.adjustments);
     }
 }
 
-Extent swapchain_extent(void* swapchain) {
+Extent swapchain_extent(void* swapchain, bool refresh_buffers) {
     if (!swapchain) return {};
     Microsoft::WRL::ComPtr<IDXGISwapChain1> chain;
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -608,11 +538,28 @@ Extent swapchain_extent(void* swapchain) {
         return SUCCEEDED(base->QueryInterface(IID_PPV_ARGS(&chain))) &&
             SUCCEEDED(chain->GetDesc1(&desc)) && desc.Width && desc.Height;
     });
-    return found ? Extent{desc.Width, desc.Height} : Extent{};
+    const Extent extent = found ? Extent{desc.Width, desc.Height} : Extent{};
+    if (found && (refresh_buffers || extent != previous_output || swapchain != previous_swapchain)) {
+        std::array<ID3D12Resource*, 16> buffers{};
+        const size_t count = std::min<size_t>(desc.BufferCount, buffers.size());
+        for (UINT i = 0; i < count; ++i) {
+            Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+            guarded([&] {
+                if (SUCCEEDED(chain->GetBuffer(i, IID_PPV_ARGS(&buffer)))) buffers[i] = buffer.Get();
+                return true;
+            });
+        }
+        graphics::set_swapchain_backbuffers(buffers.data(), count);
+    }
+    return extent;
 }
 
-void update_frame(bool sample_camera) {
+void update_rendering(bool frame) {
     const auto& current = settings;
+    if (!current.optimizer_enabled) {
+        if (frame && renderer_initialized) graphics::frame(nullptr, nullptr, current, 0, previous_output);
+        return;
+    }
     const auto* renderer = host->renderer_data;
     ID3D12Device* device{};
     ID3D12CommandQueue* queue{};
@@ -626,119 +573,117 @@ void update_frame(bool sample_camera) {
         renderer_initialized = graphics::start(device, queue, current);
         const auto status = graphics::status();
         if (!status.failed)
-            API::get()->log_info("[DD2 VRS] 0.3.1 optimizer preview | %s | tier=%u tile=%u additional_rates=%u max_rate=2x2",
+            host->functions->log_info("[DD2 VRS] 0.4.8 optimizer preview | %s | tier=%u tile=%u additional_rates=%u max_rate=2x2",
                                  status.message, status.tier, status.tile, unsigned(status.additional_rates));
     }
-    const auto output = swapchain_extent(swapchain);
-    if (renderer_reset.exchange(false) || output != previous_output) {
+    const bool reset = renderer_reset.exchange(false) || swapchain != previous_swapchain;
+    const auto output = swapchain_extent(swapchain, reset);
+    if (reset || output != previous_output) {
+        if (!output.width) graphics::set_swapchain_backbuffers(nullptr, 0);
         previous_output = output;
-        graphics::reset_gpu_frame();
-        gpu_gate = {};
-        gpu_time_ms = gpu_load_weight = 0;
-        last_gpu_sample = {};
-        timing_valid = false;
-        camera_bindings = {};
-        battle = {};
-        previous = {};
-        camera_blur = {};
-        motion = {};
-        reset_combat();
-        engine::invalidate();
-    }
-    if (sample_camera) {
-        const auto now = Clock::now();
-        if (const auto sample = graphics::begin_gpu_frame(device, queue,
-                renderer_initialized && timing_callbacks && current.enabled && current.gpu_gate.enabled)) {
-            gpu_time_ms = *sample;
-            gpu_gate.observe(*sample, current.gpu_gate);
-            last_gpu_sample = now;
-        }
-        timing_valid = current.gpu_gate.enabled && last_gpu_sample != Clock::time_point{} &&
-            now - last_gpu_sample < std::chrono::milliseconds(500);
-        if (!timing_valid) gpu_gate = {};
-        gpu_load_weight = timing_valid ? gpu_gate.weight(current.gpu_gate) : 0;
-        CameraSample next{};
-        const auto engine_state = engine::status();
-        const auto& e = current.engine;
-        const bool engine_allowed = !perf_lua_present && !engine_state.editing;
-        const bool needs_engine = (!perf_lua_present && (e.enabled || e.npc || e.crowd.enabled)) ||
-            engine_state.active_tweaks || engine_state.throttled_npcs || engine_state.pending_snapshot || engine_state.crowd.owned;
-        const bool needs_motion = (current.enabled && (current.border_blur.enabled ||
-            (current.activation_mode != always_on && (!current.gpu_gate.enabled || gpu_load_weight > 0.001f)))) ||
-            (engine_allowed && e.enabled && !e.always && !e.force_night && e.trigger_motion);
-        const bool needs_npc_position = engine_allowed && e.npc;
-        const bool needs_camera = needs_motion || needs_npc_position || (engine_allowed && e.enabled && e.heavy &&
-            (e.tweaks[ssao_half] || e.tweaks[ssr_half])) || engine_state.camera_tweaks_active || engine_state.pending_snapshot;
-        const bool found = needs_camera &&
-            guarded([&] { return read_camera(next, needs_motion || needs_npc_position); });
-        const float dt = std::chrono::duration<float>(now - previous_time).count();
-        float speed = 0;
-        const bool contiguous = needs_motion && found && previous.camera == next.camera && dt >= 0.001f && dt <= 0.2f;
-        if (contiguous) speed = velocity(previous.rotation, next.rotation, dt);
-        if (contiguous && speed * dt < 0.8f) {
-            motion.update(speed, dt, current);
-            camera_blur.update(camera_pan(previous.rotation, next.rotation, dt), dt, current.border_blur);
-        } else {
-            motion = {};
-            camera_blur = {}; // A missing camera or a cut cannot seed a blur tail.
-        }
-        previous = found ? next : CameraSample{};
-        previous_time = now;
-        camera_found = found;
-        camera_velocity = speed;
-        update_combat(now, current);
-        if (needs_engine)
-            guarded([&] {
-                engine::Camera camera{};
-                camera.game_object = next.game_object;
-                if (found && needs_npc_position) {
-                    const auto [x, y, z, w] = next.rotation;
-                    camera.forward = {2.0f * (x * z + w * y), 2.0f * (y * z - w * x),
-                                      1.0f - 2.0f * (x * x + y * y)};
-                    camera.valid = engine::position(next.transform, camera.position);
-                }
-                engine::update(current.engine, camera, motion.active, g_in_combat.load(), perf_lua_present,
-                               std::chrono::duration<double>(now.time_since_epoch()).count());
-                return true;
-            });
+        previous_swapchain = swapchain;
+        gameplay_requests.reset_world = true;
+        published_gameplay.battle_source = waiting_combat;
+        published_gameplay.optimizer.world = engine::WorldReadiness::waiting;
+        published_gameplay.motion_active = published_gameplay.in_combat = published_gameplay.camera_found = false;
     }
     const auto preset = select_preset(current);
     if (!renderer_initialized) return;
-    const unsigned variant = active_reason.load() == Activity::gpu_load
-        ? adaptive_mask(gpu_load_weight, camera_blur.alpha, camera_blur.direction.yaw, camera_blur.direction.pitch) : 0;
-    graphics::frame(device, queue, current, preset, output, variant);
+    graphics::frame(device, queue, current, preset, output);
     const auto status = graphics::status();
     if (status.failed && status.message != last_renderer_error) {
         last_renderer_error = status.message;
-        API::get()->log_error("[DD2 VRS] %s (tier %u, tile %u)", status.message, status.tier, status.tile);
+        host->functions->log_error("[DD2 VRS] %s (tier %u, tile %u)", status.message, status.tier, status.tile);
     }
-    if (sample_camera) log_diagnostics(current);
-    if (sample_camera && blur_probe_frames && --blur_probe_frames == 0) {
-        const auto report = graphics::finish_blur_probe();
-        auto& api = API::get();
-        for (const auto& sample : report.samples) {
-            if (!sample.calls) break;
-            const auto& key = sample.key;
-            constexpr const char* kinds[]{"dispatch", "draw", "draw_indexed", "indirect_dispatch"};
-            api->log_info("[DD2 VRS Blur Probe] %s shader=%016llx list=%d call=%ux%ux%u rtv=%ux%u fmt=%u count=%llu",
-                kinds[static_cast<unsigned>(key.kind)], static_cast<unsigned long long>(key.shader), key.list_type,
-                key.x, key.y, key.z, key.width, key.height, key.format, static_cast<unsigned long long>(sample.calls));
+    if (frame) log_diagnostics(current);
+}
+
+GameplayFrame update_gameplay(const Settings& current, const GameplayRequests& requests,
+                              Clock::time_point now) {
+    if (requests.reset_world) {
+        camera_bindings = {};
+        previous = {};
+        motion = {};
+        reset_combat();
+        engine::suspend_world();
+        engine::invalidate();
+    }
+    if (requests.reset_combat) reset_combat();
+    if (requests.edit) engine::edit(*requests.edit);
+    if (requests.refresh) engine::refresh();
+    if (requests.reseed_crowd) engine::reseed_crowd_limits();
+    if (requests.cancel_snapshot) engine::cancel_snapshot_restore();
+    if (requests.restore_snapshot) engine::restore_snapshot(*requests.restore_snapshot);
+
+    const auto engine_state = engine::status();
+    auto e = current.engine;
+    if (!current.optimizer_enabled) {
+        e.enabled = false;
+        e.crowd.enabled = false;
+    }
+    const bool engine_allowed = !perf_lua_present && !engine_state.editing;
+    const bool needs_engine = (!perf_lua_present && (e.enabled || e.crowd.enabled)) ||
+        engine_state.active_tweaks || engine_state.pending_snapshot || engine_state.crowd.owned;
+    engine::Object* player{};
+    const bool vrs_enabled = current.optimizer_enabled && current.enabled;
+    if (needs_engine || (current.optimizer_enabled && current.verbose_logging) ||
+        (vrs_enabled && current.activation_mode == adaptive))
+        guarded([&] { player = engine::gameplay_player(API::get()->tdb()); return true; });
+    const bool needs_motion = (vrs_enabled && current.activation_mode != always_on) ||
+        (engine_allowed && e.enabled && !e.always && !e.force_night && e.trigger_motion);
+    CameraSample next{};
+    const bool found = needs_motion && guarded([&] { return read_camera(next); });
+    const float dt = std::chrono::duration<float>(now - previous_time).count();
+    const auto camera_key = engine::object_key(next.camera);
+    const bool contiguous = found && previous.key == camera_key && dt >= 0.001f && dt <= 0.2f;
+    const float speed = contiguous ? velocity(previous.rotation, next.rotation, dt) : 0.0f;
+    if (contiguous && speed * dt < 0.8f) motion.update(speed, dt, current);
+    else motion = {};
+    previous = found ? PreviousCameraSample{camera_key, next.rotation} : PreviousCameraSample{};
+    previous_time = now;
+
+    const bool combat_active = current.optimizer_enabled && update_combat(now, current, player);
+    if (!needs_engine || !guarded([&] {
+        engine::update(e, player, next.game_object, camera_render_owner, motion.active, combat_active, perf_lua_present,
+                       std::chrono::duration<double>(now.time_since_epoch()).count());
+        return true;
+    })) engine::suspend_world();
+    return {engine::status(), engine::baselines(), battle_source, speed, found, motion.active, combat_active};
+}
+
+void on_update_behavior() noexcept {
+    if (!callbacks_ready.load(std::memory_order_acquire)) return;
+    try {
+        Settings current;
+        GameplayRequests requests;
+        {
+            std::lock_guard lock{frame_mutex};
+            current = settings;
+            requests = std::exchange(gameplay_requests, {});
         }
-        api->log_info("[DD2 VRS Blur Probe] End dropped=%llu", static_cast<unsigned long long>(report.overflow));
-    }
+
+        // Keep the render/UI lock out of the VM call path.
+        GameplayFrame next;
+        if (!guarded([&] { next = update_gameplay(current, requests, Clock::now()); return true; }))
+            engine::suspend_world();
+        std::lock_guard lock{frame_mutex};
+        if (gameplay_requests.reset_world) return;
+        if (gameplay_requests.reset_combat) {
+            next.in_combat = false;
+            next.battle_source = waiting_combat;
+        }
+        published_gameplay = next;
+    } catch (...) {}
 }
 
 void on_begin_rendering() noexcept {
+    if (!callbacks_ready.load(std::memory_order_acquire)) return;
     try {
         std::lock_guard lock{frame_mutex};
-        if (guarded([] { update_frame(true); return true; })) return;
+        if (guarded([] { update_rendering(true); return true; })) return;
     } catch (...) {}
     graphics::set_preset(0);
     active_reason.store(Activity::idle);
-}
-
-void on_present() noexcept {
-    try { guarded([] { graphics::end_gpu_frame(); return true; }); } catch (...) {}
 }
 
 void on_renderer_reset() noexcept {
@@ -785,29 +730,30 @@ void draw_ui() {
     Activity reason{};
     float speed{};
     bool found{};
-    CameraBlurEnvelope blur{};
     engine::Status engine_status{};
-    float gpu_ms{}, load{};
-    bool gpu_valid{}, in_combat{};
-    unsigned capture_frames{};
+    bool in_combat{};
     {
         std::lock_guard lock{frame_mutex};
         d = graphics::status();
         current = settings;
         reason = active_reason.load(std::memory_order_relaxed);
-        combat_source = battle_source;
-        speed = camera_velocity;
-        found = camera_found;
-        blur = camera_blur;
-        gpu_ms = gpu_time_ms;
-        gpu_valid = timing_valid;
-        load = gpu_load_weight;
-        in_combat = g_in_combat.load();
-        engine_status = engine::status();
-        capture_frames = blur_probe_frames;
+        combat_source = published_gameplay.battle_source;
+        speed = published_gameplay.camera_speed;
+        found = published_gameplay.camera_found;
+        in_combat = published_gameplay.in_combat;
+        engine_status = published_gameplay.optimizer;
     }
+    const bool apply_recommended = ui.button("Recommended Steam Deck settings", {});
+    if (apply_recommended) current = recommended_steam_deck_settings();
+    const bool switch_optimizer = ui.button(current.optimizer_enabled ? "Switch Optimizer Off" : "Switch Optimizer On", {});
+    if (switch_optimizer) current.optimizer_enabled = !current.optimizer_enabled;
     char text[256];
-    if (full_sharp_center(current.center)) {
+    if (!current.optimizer_enabled) {
+        const bool restoring = engine_status.active_tweaks || engine_status.crowd.owned;
+        const char* line = restoring ? "Optimizer off. Restoring game settings..." :
+            d.hot_hooks_active ? "Optimizer off. Finishing D3D12 command lists..." : "Optimizer off";
+        std::snprintf(text, sizeof(text), "%s", line);
+    } else if (full_sharp_center(current.center)) {
         std::snprintf(text, sizeof(text), "State: Full-screen 1x1");
     } else if (d.preset && d.scene.width && d.image == d.scene) {
         const auto& profile = profiles[d.preset - 1];
@@ -816,51 +762,27 @@ void draw_ui() {
         std::snprintf(text, sizeof(text), "State: IDLE (1x1)%s", d.preset ? " | Waiting for scene image" : "");
     }
     ui.text(text, nullptr);
-    const float effective_load = d.preset && d.scene.width && d.image == d.scene ?
-        (reason == Activity::gpu_load ? load : 1.0f) : 0.0f;
-    if (gpu_valid)
-        std::snprintf(text, sizeof(text), "GPU %.2f ms | VRS %.2f | Camera %.2f rad/s | Motion %.2f",
-            gpu_ms, effective_load, speed, blur.alpha);
-    else
-        std::snprintf(text, sizeof(text), "GPU time unavailable | VRS %.2f | Camera %.2f rad/s | Motion %.2f",
-            effective_load, speed, blur.alpha);
-    ui.text(text, nullptr);
-    std::snprintf(text, sizeof(text), "Combat: %s | Night: %s | NPCs throttled: %d",
-        in_combat ? "Yes" : "No", engine_status.clock_valid ? (engine_status.night ? "Yes" : "No") : "Unknown",
-        engine_status.throttled_npcs);
+    std::snprintf(text, sizeof(text), "Combat: %s | Night: %s",
+        in_combat ? "Yes" : "No", engine_status.clock_valid ? (engine_status.night ? "Yes" : "No") : "Unknown");
     ui.text(text, nullptr);
     if (d.failed) ui.text(d.message, nullptr);
+    if (d.hot_hooks_out_of_sync) ui.text("D3D12 hook toggle failed. Retrying...", nullptr);
     ui.text("Activation Mode", nullptr);
-    bool changed = ui.radio("Adaptive (Motion + Combat)", &current.activation_mode, adaptive);
+    bool changed = apply_recommended || switch_optimizer;
+    changed |= ui.radio("Adaptive (Motion + Combat)", &current.activation_mode, adaptive);
     changed |= ui.radio("Force Always On", &current.activation_mode, always_on);
     changed |= ui.radio("Motion Only", &current.activation_mode, motion_only);
     ui.text("VRS Profile", nullptr);
     changed |= ui.radio("Default (Balanced Soft)", &current.profile_mode, 0);
     changed |= ui.radio("Extreme (Max Performance)", &current.profile_mode, 1);
     changed |= ui.checkbox("Shade Alpha / Particle Passes", &current.shade_transparent_passes);
+    changed |= ui.checkbox("Allow VRS at Native Resolution", &current.allow_native_vrs);
     changed |= draw_center_size(current, d);
 
-    bool capture_blur = false, edit_engine = false, resume_engine = false, refresh_engine = false;
+    bool edit_engine = false, resume_engine = false, refresh_engine = false;
     bool write_snapshot = false, read_snapshot = false, cancel_snapshot = false;
-    if (ui.header("Adaptive VRS & Border Motion Blur", 0)) {
-        changed |= ui.checkbox("Enable Adaptive GPU Load Trigger", &current.gpu_gate.enabled);
-        changed |= ui.slider("Target GPU Frame Time", &current.gpu_gate.target_ms, 16.6f, 33.3f, "%.1f ms", 0);
-        changed |= ui.slider("Hysteresis Band", &current.gpu_gate.band_ms, 1.0f, 5.0f, "%.1f ms", 0);
-        changed |= ui.checkbox("Enable Dynamic VRS Border Motion Blur", &current.border_blur.enabled);
-        changed |= ui.slider("Border Blur Multiplier", &current.border_blur.multiplier, 1.0f, 3.0f, "%.2fx", 0);
-        changed |= ui.slider("Camera Velocity Threshold", &current.border_blur.threshold, 0.05f, 1.0f, "%.2f rad/s", 0);
-        changed |= ui.slider("Temporal Decay Time", &current.border_blur.fade_ms, 50.0f, 250.0f, "%.0f ms", 0);
-        ui.text("Native motion blur needs a verified post-upscaler pass.", nullptr);
-        if (current.border_blur.enabled) {
-            std::snprintf(text, sizeof(text), "Yaw %+.2f | Pitch %+.2f | Roll %+.2f | Requested blur %.2f",
-                blur.direction.yaw, blur.direction.pitch, blur.direction.roll, effective_load * blur.alpha);
-            ui.text(text, nullptr);
-        }
-        if (capture_frames) ui.text("Capturing pipeline IDs", nullptr);
-        else capture_blur = ui.button("Capture Motion Blur Pipelines", {});
-    }
     auto& e = current.engine;
-    if (ui.header("Engine & Foliage/Shadow Optimizer", 0)) {
+    if (ui.header("Native Engine Optimizer", 0)) {
         if (perf_lua_present) ui.text("Native engine writes paused because perf.lua is installed.", nullptr);
         changed |= ui.checkbox("Enable Native Engine Optimizer", &e.enabled);
         if (e.enabled) {
@@ -881,27 +803,29 @@ void draw_ui() {
         changed |= ui.slider("Combat Hold", &current.combat_exit_delay, 0.0f, 6.0f, "%.2f s", 0);
         changed |= ui.slider("SpeedTree Target", &e.speedtree_bias, 0.0f, 5.0f, "%.0f", 0);
         changed |= ui.slider("Motion Quality Target", &e.motion_target, 0.0f, 1.0f, "%.0f", 0);
-        changed |= ui.slider("Foliage Distance Retained", &e.foliage_retention, 50.0f, 95.0f, "%.0f%%", 0);
         changed |= ui.checkbox("Allow Heavy Render-Target Tweaks", &e.heavy);
         if (e.heavy) {
             changed |= ui.slider("Shadow Quality Target", &e.shadow_target, 0.0f, 4.0f, "%.0f", 0);
             changed |= ui.slider("Shadow Resolution Limit", &e.shadow_pixels, 384.0f, 4096.0f, "%.0f px", 0);
         }
-        for (size_t i = 0; i < e.tweaks.size() && (i < shadow_quality || e.heavy); ++i) {
+        const auto show_binding = [&](size_t i) {
+            if (!e.tweak_enabled(i) || !engine_status.tweak_status[i]) return;
+            std::snprintf(text, sizeof(text), "%s | %s%s%s", engine_labels[i], engine_status.tweak_status[i],
+                engine_status.properties[i] ? " | " : "", engine_status.properties[i] ? engine_status.properties[i] : "");
+            ui.text(text, nullptr);
+        };
+        for (size_t i = 0; i < e.tweaks.size(); ++i) {
+            if (heavy_tweak(i) && !e.heavy) continue;
             changed |= ui.checkbox(engine_labels[i], &e.tweaks[i]);
-            if (i == effects && e.tweaks[i]) changed |= ui.checkbox("Particle LOD Only In Combat", &e.effects_combat_only);
-            if (e.tweaks[i] && engine_status.tweak_status[i]) {
-                std::snprintf(text, sizeof(text), "%s%s%s", engine_status.tweak_status[i],
-                    engine_status.properties[i] ? " | " : "", engine_status.properties[i] ? engine_status.properties[i] : "");
-                ui.text(text, nullptr);
-            }
+            show_binding(i);
+            if (i == oov_streaming_off) show_binding(oov_texture_streaming_off);
         }
         std::snprintf(text, sizeof(text), "Active overrides: %d", engine_status.active_tweaks);
         ui.text(text, nullptr);
         if (engine_status.editing) {
             if (engine_status.pending_snapshot)
                 cancel_snapshot = ui.button("Cancel Saved Baseline Restore", {});
-            if (engine_status.active_tweaks || engine_status.throttled_npcs || engine_status.pending_snapshot || engine_status.crowd.owned)
+            if (engine_status.active_tweaks || engine_status.pending_snapshot || engine_status.crowd.owned)
                 ui.text("Restoring baseline", nullptr);
             else {
                 ui.text("Baseline restored. Edit in-game settings now.", nullptr);
@@ -910,7 +834,7 @@ void draw_ui() {
         } else edit_engine = ui.button("Restore Baseline / Edit Settings", {});
         refresh_engine = ui.button("Retry Engine Bindings", {});
         write_snapshot = ui.button("Save Baseline Snapshot", {});
-        if (!perf_lua_present) {
+        if (!perf_lua_present && current.optimizer_enabled) {
             if (confirm_snapshot_restore) {
                 read_snapshot = ui.button("Confirm Saved Baseline Restore", {});
                 if (read_snapshot || ui.button("Cancel##snapshot_confirmation", {})) confirm_snapshot_restore = false;
@@ -931,6 +855,7 @@ void draw_ui() {
         changed |= ui.checkbox("Enable CPU & Crowd Optimizer", &c.enabled);
         if (perf_lua_present) ui.text("Native CPU writes paused because perf.lua is installed.", nullptr);
         else if (engine_status.editing || live.restoring) ui.text("Crowd overrides paused for baseline restoration.", nullptr);
+        else if (c.enabled && engine_status.world != engine::WorldReadiness::ready) ui.text(world_label(engine_status.world), nullptr);
         else if (c.enabled && live.paused) ui.text(live.pause_available ? "Paused in game menu" : "Waiting for GUI pause binding", nullptr);
         else if (c.enabled) {
             std::snprintf(text, sizeof(text), "%s | FPS %.1f (avg %.1f, min %.1f, max %.1f) | Adjustments %d",
@@ -961,37 +886,17 @@ void draw_ui() {
         changed |= int_slider("Maximum NPCs", c.npc_max, 20, 60);
         changed |= int_slider("Minimum Stray Pawns", c.pawn_min, 0, 20);
         changed |= int_slider("Maximum Stray Pawns", c.pawn_max, 0, 30);
+        bool game_pawn_baseline = !c.pawn_baseline.has_value();
+        if (ui.checkbox("Use Game's Baseline Pawn Cap", &game_pawn_baseline)) {
+            if (game_pawn_baseline) c.pawn_baseline.reset();
+            else c.pawn_baseline = live.caps_ready ? live.vanilla_pawn : c.pawn_min;
+            changed = true;
+        }
+        if (c.pawn_baseline) changed |= int_slider("Baseline Pawns", *c.pawn_baseline, c.pawn_min, c.pawn_max);
         if (ui.button("Restore Game NPC / Pawn Caps", {})) {
             c.npc = c.pawn = false;
             c.manual_npc_limit = 0;
             changed = true;
-        }
-        changed |= ui.checkbox("Distance-Based Character LOD", &c.lod);
-        changed |= ui.checkbox("Distance-Based Cloth / Hair Freezing", &c.chain);
-        if (c.lod) {
-            changed |= ui.slider("Facial Cutoff", &c.facial_distance, 10.0f, 60.0f, "%.0f m", 0);
-            changed |= ui.slider("Joint Cutoff", &c.joint_distance, 15.0f, 80.0f, "%.0f m", 0);
-            changed |= ui.slider("Upper Body Cutoff", &c.upper_distance, 20.0f, 100.0f, "%.0f m", 0);
-        }
-        if (c.chain) {
-            changed |= ui.slider("Start Cloth / Hair Freeze", &c.freeze_near, 10.0f, 60.0f, "%.0f m", 0);
-            changed |= ui.slider("Full Cloth / Hair Freeze", &c.freeze_far, 25.0f, 120.0f, "%.0f m", 0);
-        }
-        if (c.enabled && (c.lod || c.chain) && !perf_lua_present) {
-            std::snprintf(text, sizeof(text), "Distance checks %d | Disabled facial %d, joint %d, upper body %d | Chain %d partial, %d frozen",
-                live.processed, live.facial, live.joint, live.upper, live.partial, live.frozen);
-            ui.text(text, nullptr);
-            if (!live.list_sources) ui.text("Waiting for a compatible character list", nullptr);
-            else {
-                std::snprintf(text, sizeof(text), "Lists available | Enemies %s | NPCs %s | Stray pawns %s",
-                    live.list_sources & 1 ? "Yes" : "No", live.list_sources & 2 ? "Yes" : "No",
-                    live.list_sources & 4 ? "Yes" : "No");
-                ui.text(text, nullptr);
-                std::snprintf(text, sizeof(text), "Read/write bindings found | Facial %s | Joint %s | Upper body %s | Chain %s",
-                    live.bound_lods & 1 ? "Yes" : "No", live.bound_lods & 2 ? "Yes" : "No",
-                    live.bound_lods & 4 ? "Yes" : "No", live.bound_lods & 8 ? "Yes" : "No");
-                ui.text(text, nullptr);
-            }
         }
         if (ui.header("Crowd Timing & Steps", 0)) {
             changed |= int_slider("NPC Step", c.npc_step, 1, 12);
@@ -999,16 +904,8 @@ void draw_ui() {
             changed |= int_slider("FPS Sample Frames", c.sample_window, 20, 240);
             changed |= int_slider("Cap Adjustment Frames", c.adjust_interval, 1, 600);
             changed |= int_slider("Cap Direction Hysteresis Frames", c.hysteresis, 0, 1200);
-            changed |= int_slider("Distance Check Interval Frames", c.lod_interval, 1, 600);
         }
     }
-    if (ui.header("CPU Behind-Camera NPC Throttling", 0)) {
-        changed |= ui.checkbox("Enable NPC Throttling", &e.npc);
-        changed |= ui.slider("Behind-Camera Cone Dot", &e.npc_dot, -0.9f, -0.15f, "%.2f", 0);
-        changed |= ui.slider("Minimum NPC Distance", &e.npc_distance, 8.0f, 50.0f, "%.1f m", 0);
-        if (e.npc && !engine_status.npc_bindings) ui.text("Waiting for a compatible NPC list and motion binding.", nullptr);
-    }
-
     const bool advanced = ui.header("Advanced / Debug", 0);
     if (advanced) {
         changed |= ui.checkbox("Enable foveated VRS", &current.enabled);
@@ -1016,14 +913,16 @@ void draw_ui() {
         std::snprintf(text, sizeof(text), "VRS Tier %u | Tile %u x %u | Transition %s",
                       d.tier, d.tile, d.tile, d.additional_rates ? "2x1 / 1x2" : "2x2 fallback");
         ui.text(text, nullptr);
-        std::snprintf(text, sizeof(text), "Scene %u x %u | Output %u x %u | Indirect calls with image %llu",
-                      d.scene.width, d.scene.height, d.output.width, d.output.height,
-                      static_cast<unsigned long long>(d.indirect_with_image));
+        std::snprintf(text, sizeof(text), "Scene %u x %u | Output %u x %u",
+                      d.scene.width, d.scene.height, d.output.width, d.output.height);
         ui.text(text, nullptr);
-        std::snprintf(text, sizeof(text), "Previous frame: %llu/%llu indexed draws shaded",
-                      static_cast<unsigned long long>(d.shaded), static_cast<unsigned long long>(d.candidates));
-        ui.text(text, nullptr);
-        if (current.activation_mode == adaptive) {
+        if (current.verbose_logging) {
+            std::snprintf(text, sizeof(text), "Previous frame: %llu/%llu indexed draws shaded | %llu indirect calls with image",
+                          static_cast<unsigned long long>(d.shaded), static_cast<unsigned long long>(d.candidates),
+                          static_cast<unsigned long long>(d.indirect_with_image));
+            ui.text(text, nullptr);
+        }
+        {
             std::snprintf(text, sizeof(text), "Combat source: %s", combat_source);
             ui.text(text, nullptr);
         }
@@ -1032,44 +931,46 @@ void draw_ui() {
             ui.text(text, nullptr);
         }
     }
-    if (changed || capture_blur || edit_engine || resume_engine || refresh_engine || cancel_snapshot) {
+    if (changed || edit_engine || resume_engine || refresh_engine || cancel_snapshot) {
         std::lock_guard lock{frame_mutex};
-        if (settings.activation_mode != current.activation_mode || settings.enabled != current.enabled)
-            reset_combat();
-        if (settings.verbose_logging != current.verbose_logging) next_diagnostics = {};
-        sanitize(current.border_blur);
-        sanitize(current.engine);
-        current.gpu_gate.target_ms = std::clamp(current.gpu_gate.target_ms, 16.6f, 33.3f);
-        current.gpu_gate.band_ms = std::clamp(current.gpu_gate.band_ms, 1.0f, 5.0f);
-        if (settings.gpu_gate.enabled != current.gpu_gate.enabled ||
-            settings.gpu_gate.target_ms != current.gpu_gate.target_ms || settings.gpu_gate.band_ms != current.gpu_gate.band_ms) {
-            gpu_gate = {};
-            gpu_load_weight = 0;
-            last_gpu_sample = {};
-            timing_valid = false;
+        const bool optimizer_changed = settings.optimizer_enabled != current.optimizer_enabled;
+        if (optimizer_changed || settings.activation_mode != current.activation_mode || settings.enabled != current.enabled) {
+            gameplay_requests.reset_combat = true;
+            published_gameplay.in_combat = false;
+            published_gameplay.battle_source = waiting_combat;
         }
-        if (!current.enabled) camera_blur = {};
-        if (settings.engine != current.engine || refresh_engine) engine::refresh();
+        if (optimizer_changed || settings.verbose_logging != current.verbose_logging) next_diagnostics = {};
+        sanitize(current);
+        if (optimizer_changed) {
+            graphics::set_optimizer_enabled(current.optimizer_enabled);
+            if (!current.optimizer_enabled) {
+                gameplay_requests.cancel_snapshot = true;
+                gameplay_requests.restore_snapshot.reset();
+                confirm_snapshot_restore = false;
+            }
+        }
+        if (optimizer_changed || settings.engine != current.engine || refresh_engine) gameplay_requests.refresh = true;
+        if (apply_recommended || settings.engine.crowd.npc_baseline != current.engine.crowd.npc_baseline ||
+            settings.engine.crowd.pawn_baseline != current.engine.crowd.pawn_baseline)
+            gameplay_requests.reseed_crowd = true;
         settings = current;
-        if (edit_engine) engine::edit(true);
-        if (resume_engine) engine::edit(false);
+        if (edit_engine) gameplay_requests.edit = true;
+        if (resume_engine) {
+            gameplay_requests.edit = false;
+            gameplay_requests.restore_snapshot.reset();
+        }
         if (cancel_snapshot) {
-            engine::cancel_snapshot_restore();
+            gameplay_requests.cancel_snapshot = true;
+            gameplay_requests.restore_snapshot.reset();
             snapshot_status = "Saved baseline restore stopped";
         }
         graphics::set_transparent_passes(current.shade_transparent_passes);
         const auto preset = select_preset(current);
-        graphics::set_preset(preset, active_reason.load() == Activity::gpu_load
-            ? adaptive_mask(gpu_load_weight, camera_blur.alpha, camera_blur.direction.yaw, camera_blur.direction.pitch) : 0);
-        if (capture_blur && !blur_probe_frames) {
-            API::get()->log_info("[DD2 VRS Blur Probe] Begin next four game frames");
-            graphics::begin_blur_probe();
-            blur_probe_frames = 5;
-        }
+        graphics::set_preset(preset);
     }
     if (write_snapshot) {
         engine::Baselines values;
-        { std::lock_guard lock{frame_mutex}; values = engine::baselines(); }
+        { std::lock_guard lock{frame_mutex}; values = published_gameplay.baselines; }
         try { snapshot_status = save_baseline(values) ? "Baseline snapshot saved" : "No baseline snapshot saved"; }
         catch (...) { snapshot_status = "Could not save baseline snapshot"; }
     }
@@ -1077,16 +978,16 @@ void draw_ui() {
         try {
             if (const auto values = load_baseline()) {
                 std::lock_guard lock{frame_mutex};
-                engine::restore_snapshot(*values);
+                gameplay_requests.restore_snapshot = *values;
                 snapshot_status = "Restoring saved baseline on the game thread";
             } else snapshot_status = "No usable saved baseline";
         } catch (...) { snapshot_status = "Could not load baseline snapshot"; }
     }
-    if (advanced && ui.button("Save Config", {})) {
+    if (changed) {
         try { save_status = save_config(current) ? "Config saved" : "Could not save config"; }
         catch (...) { save_status = "Could not save config"; }
     }
-    if (advanced && save_status) ui.text(save_status, nullptr);
+    if (save_status && (advanced || std::string_view(save_status) == "Could not save config")) ui.text(save_status, nullptr);
 }
 
 void on_imgui_draw_ui(REFImGuiFrameCbData* data) noexcept {
@@ -1114,13 +1015,10 @@ bool initialize(const REFrameworkPluginInitializeParam* param) {
     API::initialize(param);
     host = param;
     settings = read_config();
+    graphics::set_optimizer_enabled(settings.optimizer_enabled);
     std::error_code filesystem_error;
     perf_lua_present = std::filesystem::exists(config_path.parent_path().parent_path() /
         L"autorun" / L"perf.lua", filesystem_error);
-    guarded([] {
-        if (const auto* tdb = API::get()->tdb()) resolve_battle(tdb);
-        return true;
-    });
     ui_ready = param->reframework_module && ui.bind(static_cast<HMODULE>(param->reframework_module));
     if (!ui_ready)
         API::get()->log_warn("[DD2 VRS] REFramework cimgui exports unavailable. JSON settings remain available.");
@@ -1128,15 +1026,17 @@ bool initialize(const REFrameworkPluginInitializeParam* param) {
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                             address, &module)) return false;
     const auto* functions = param->functions;
-    if (!functions->on_pre_application_entry("BeginRendering", on_begin_rendering)) return false;
-    timing_callbacks = functions->on_present && functions->on_present(on_present);
+    if (!functions->on_pre_application_entry("UpdateBehavior", on_update_behavior) ||
+        !functions->on_pre_application_entry("BeginRendering", on_begin_rendering)) return false;
     if (functions->on_device_reset) functions->on_device_reset(on_renderer_reset);
     if (ui_ready && !functions->on_imgui_draw_ui(on_imgui_draw_ui))
         API::get()->log_warn("[DD2 VRS] Could not register the REFramework ImGui callback.");
     {
         std::lock_guard lock{frame_mutex};
-        guarded([] { update_frame(false); return true; });
+        guarded([] { update_rendering(false); return true; });
     }
+    callbacks_ready.store(true, std::memory_order_release);
+    API::get()->log_info("[DD2 VRS] Gameplay callbacks | UpdateBehavior=VM BeginRendering=D3D12 population_grace=2.0s");
     return true;
 }
 } // namespace
